@@ -11,6 +11,7 @@ use the CLI once and the next poll picks up the new one.
 import base64
 import ctypes
 import json
+import os
 import sys
 import subprocess
 import threading
@@ -21,7 +22,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 
 import pystray
-from PIL import Image
+from PIL import Image, ImageTk
 
 import usage_stats
 import urllib.error
@@ -48,7 +49,7 @@ def light_theme() -> bool:
 LIGHT = light_theme()
 FG, DIM = ("#000000", "#707070") if LIGHT else ("#ffffff", "#9a9a9a")
 APP = "VibeQuota"
-VERSION = "1.0.0"  # keep in step with the release tag (v1.0.0): the updater compares the two
+VERSION = "1.0.3"  # keep in step with the release tag (v1.0.3): the updater compares the two
 REPO = "hiepkhach1005/VibeQuota"
 UPDATE_EVERY_MS = 6 * 3600 * 1000
 
@@ -109,7 +110,7 @@ if OLD_DIR.is_dir() and not SETTINGS.parent.exists():
 CACHE = SETTINGS.with_name("last_quota.json")  # last good quota per tool, shown at start-up until a fetch works
 DEFAULT_FONT = {"family": "Tahoma", "size": 10, "bold": False, "italic": False,
                 "refresh": 60,  # seconds; Token Watch also refreshes quota every minute
-                "autostart": True, "autoupdate": True}
+                "autostart": True, "autoupdate": True, "remaining": False}
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -140,7 +141,8 @@ def taskbar_colour() -> str:
     dc = u.GetDC(0)
     tray = wintypes.RECT()  # sample just left of the tray icons, where the widget sits
     u.GetWindowRect(u.FindWindowExW(u.FindWindowW("Shell_TrayWnd", None), None, "TrayNotifyWnd", None), ctypes.byref(tray))
-    c = ctypes.windll.gdi32.GetPixel(dc, (tray.left or r.right - 300) - 2, r.bottom - 3)
+    # bottom edge of the taskbar: the widget is vertically centred and shorter, so this is never our own pixel
+    c = ctypes.windll.gdi32.GetPixel(dc, (tray.left or r.right - 300) - 2, r.bottom - 1)
     u.ReleaseDC(0, dc)
     if c == 0xFFFFFFFF:
         return "#eef0f3" if LIGHT else "#1c1c1d"
@@ -163,7 +165,7 @@ def taskbar_spot(w: int, h: int) -> tuple[int, int]:
     work = wintypes.RECT()
     u.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA: taskbar is below it
     screen_h = u.GetSystemMetrics(1)
-    return left - w - 8, work.bottom + (screen_h - work.bottom - h) // 2
+    return left - w + 6, work.bottom + (screen_h - work.bottom - h) // 2
 
 
 def get_json(url: str, headers: dict) -> dict:
@@ -381,15 +383,16 @@ def popup_segments(key: str, d: dict | None, st: dict | None) -> list[tuple[str,
     plan = (d or {}).get("plan")
     line((name, "title"), (f"  {plan}" if plan else "", "dim"))
     line((account, "dim"))
-    if d and d.get("error"):
+    if d and d.get("error") and not d["error"].startswith("rate limited"):  # a 429 just retries later: not worth a line
         cached = d["error"].startswith("cached from")  # start-up: saved numbers until the first fetch
         line((("" if cached else "! ") + d["error"], "dim" if cached else "err"))
     line(("", ""))
 
     if d and d.get("limits"):
-        line((f"{'Limit':<12}{'Used':>6}   {'Resets at':<12}", "head"))
+        line((f"{'Limit':<12}{'Used':>6}{'Left':>7}   {'Resets at':<12}", "head"))
         for label, pct, reset in d["limits"]:
-            line((f"{label:<12}", ""), (f"{pct:>5.0f}%", "pct_" + level(pct)), (f"   {reset:<12}", ""))
+            line((f"{label:<12}", ""), (f"{pct:>5.0f}%", "pct_" + level(pct)),
+                 (f"{100 - pct:>6.0f}%", "pct_" + level(pct)), (f"   {reset:<12}", ""))
         for note in d.get("notes") or []:
             line((note, "err" if "REACHED" in note else "dim"))
         line(("", ""))
@@ -481,22 +484,31 @@ class App:
         self.font = tkfont.Font(self.root, family=cfg["family"], size=cfg["size"],
                                 weight="bold" if cfg["bold"] else "normal",
                                 slant="italic" if cfg["italic"] else "roman")
-        self.icons = {"codex": tk.PhotoImage(file=str(ASSETS / f"icon_codex_{'light' if LIGHT else 'dark'}.png")),
-                      "claude": tk.PhotoImage(file=str(ASSETS / "icon_claude.png"))}
+        self.icon_src = {"codex": Image.open(ASSETS / f"icon_codex_{'light' if LIGHT else 'dark'}.png"),
+                         "claude": Image.open(ASSETS / "icon_claude.png")}
+        self.icons = {}
+        self.dpi = 0
+        self.icon_labels = {}
         for r, key in enumerate(self.sources):
-            b = tk.Label(self.root, image=self.icons[key], bg=BG, bd=0)
+            b = tk.Label(self.root, bg=BG, bd=0)
             b.grid(row=r, column=0, padx=(2, 4), pady=0)
-            h5 = tk.Label(self.root, text="5H --%", bg=BG, fg=DIM, font=self.font, width=7, anchor="e", bd=0, pady=0)
-            wk = tk.Label(self.root, text="W --%", bg=BG, fg=DIM, font=self.font, width=6, anchor="e", bd=0, pady=0)
-            h5.grid(row=r, column=1)
-            wk.grid(row=r, column=2, padx=(0, 2))
-            self.rows[key] = (h5, wk)
-            for w in (b, h5, wk):
-                w.bind("<Enter>", lambda e, k=key: self.show_tip(k))
-                w.bind("<Leave>", lambda e: self.hide_tip())
+            # tags stay put; each number follows its tag, in a column wide enough for "100%"
+            t5, h5, tw, wk = (tk.Label(self.root, text=t, bg=BG, fg=DIM, font=self.font, bd=0, padx=0, pady=0)
+                              for t in ("5H", "--%", "W", "--%"))
+            t5.grid(row=r, column=1, sticky="w")
+            h5.grid(row=r, column=2, sticky="w", padx=(3, 0))
+            tw.grid(row=r, column=3, sticky="w", padx=(4, 0))
+            wk.grid(row=r, column=4, sticky="w", padx=(3, 2))
+            self.rows[key] = (t5, h5, tw, wk)
+            self.icon_labels[key] = b
+            for w in (b, t5, h5, tw, wk):
+                w.bind("<Enter>", lambda e: self.hover_enter())
+                w.bind("<Leave>", lambda e: self.hover_leave())
         self.tip = None
+        self.root.bind("<Enter>", lambda e: self.hover_enter())  # the gaps between the labels count as the widget
+        self.root.bind("<Leave>", lambda e: self.hover_leave())
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Refresh", command=self.refresh)
+        self.menu.add_command(label="Refresh", command=self.menu_refresh)
         self.v_family = tk.StringVar(value=cfg["family"])
         self.v_size = tk.IntVar(value=cfg["size"])
         self.v_bold = tk.BooleanVar(value=cfg["bold"])
@@ -512,6 +524,11 @@ class App:
         self.menu.add_cascade(label="Size", menu=size)
         self.menu.add_checkbutton(label="Bold", variable=self.v_bold, command=self.apply_font)
         self.menu.add_checkbutton(label="Italic", variable=self.v_italic, command=self.apply_font)
+        self.v_remaining = tk.BooleanVar(value=cfg["remaining"])
+        show = tk.Menu(self.menu, tearoff=0)
+        show.add_radiobutton(label="Used %", variable=self.v_remaining, value=False, command=self.apply_remaining)
+        show.add_radiobutton(label="Remaining %", variable=self.v_remaining, value=True, command=self.apply_remaining)
+        self.menu.add_cascade(label="Show", menu=show)
         self.v_refresh = tk.IntVar(value=cfg["refresh"])
         every = tk.Menu(self.menu, tearoff=0)
         for sec, label in REFRESH_CHOICES:
@@ -532,15 +549,15 @@ class App:
             w.bind("<Button-1>", lambda e: self.click_refresh())
         self.root.update_idletasks()
         self.hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-        self.embed()
         self.cfg = cfg  # plain copy the tray thread can read; tk variables are only touched on the tk thread
+        self.embed()
         M = pystray.MenuItem
 
         def tray_set(var, value, then=None):  # tray callbacks run on pystray's thread: hand the change to tk
             return lambda: self.root.after(0, lambda: (var.set(value), (then or self.apply_font)()))
 
         self.tray = pystray.Icon(APP, Image.open(ASSETS / "app_icon.png"), APP, pystray.Menu(
-            M("Refresh", lambda: self.root.after(0, self.refresh)),
+            M("Refresh", lambda: self.root.after(0, self.menu_refresh)),
             pystray.Menu.SEPARATOR,
             M("Font", pystray.Menu(*[M(f, tray_set(self.v_family, f), radio=True,
                                        checked=lambda i, f=f: self.cfg["family"] == f) for f in FONT_CHOICES])),
@@ -550,6 +567,9 @@ class App:
               checked=lambda i: self.cfg["bold"]),
             M("Italic", lambda: self.root.after(0, lambda: (self.v_italic.set(not self.v_italic.get()), self.apply_font())),
               checked=lambda i: self.cfg["italic"]),
+            M("Show", pystray.Menu(*[M(label, tray_set(self.v_remaining, rem, self.apply_remaining), radio=True,
+                                       checked=lambda i, rem=rem: self.cfg["remaining"] == rem)
+                                     for rem, label in ((False, "Used %"), (True, "Remaining %"))])),
             M("Start with Windows",
               lambda: self.root.after(0, lambda: (self.v_autostart.set(not self.v_autostart.get()),
                                                   self.apply_autostart())),
@@ -574,8 +594,25 @@ class App:
         cfg = self.save_settings()
         self.font.configure(family=cfg["family"], size=cfg["size"], weight="bold" if cfg["bold"] else "normal",
                             slant="italic" if cfg["italic"] else "roman")
+        self.fit_columns()
         self.root.update_idletasks()
-        self.embed(reschedule=False)  # resize/reposition now for the new text width
+        self.embed(full=False)  # resize/reposition now for the new text width
+
+    def fit_columns(self):
+        # the 5H number column fits "100%" so W never moves; the last column is as wide as its text; measured from the current font so size and DPI changes follow
+        self.root.grid_columnconfigure(2, minsize=self.font.measure("100%") + 3)  # + padx of the number
+
+    def apply_dpi(self, dpi):
+        """Display scale changed (100% -> 125% ...): rescale fonts (widget and hover), columns and icons."""
+        self.dpi = dpi
+        self.root.tk.call("tk", "scaling", dpi / 72)  # point sizes -> pixels at the new scale
+        self.font.configure(size=self.cfg["size"])  # re-measure at the new scaling
+        px = round(18 * dpi / 96)
+        for key, b in self.icon_labels.items():
+            self.icons[key] = ImageTk.PhotoImage(self.icon_src[key].resize((px, px), Image.LANCZOS))
+            b.configure(image=self.icons[key])
+        self.fit_columns()
+        self.root.update_idletasks()
 
     def apply_refresh(self):
         self.save_settings()
@@ -621,7 +658,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def restart_after_update(self):
-        subprocess.Popen([sys.executable, "--after-update"], close_fds=True,
+        # onefile: without the reset the new exe reuses our temp _MEI folder, which is deleted as we exit
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen([sys.executable, "--after-update"], close_fds=True, env=env,
                          creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
         self.quit()
 
@@ -634,7 +673,8 @@ class App:
     def save_settings(self) -> dict:
         cfg = {"family": self.v_family.get(), "size": self.v_size.get(), "bold": self.v_bold.get(),
                "italic": self.v_italic.get(), "refresh": self.v_refresh.get(),
-               "autostart": self.v_autostart.get(), "autoupdate": self.v_autoupdate.get()}
+               "autostart": self.v_autostart.get(), "autoupdate": self.v_autoupdate.get(),
+               "remaining": self.v_remaining.get()}
         self.cfg = cfg
         self.tray.update_menu()
         SETTINGS.parent.mkdir(parents=True, exist_ok=True)
@@ -642,11 +682,15 @@ class App:
         return cfg
 
     def quit(self):
-        self.tray.stop()
-        self.root.destroy()
+        try:
+            self.tray.stop()
+            self.root.destroy()
+        finally:
+            os._exit(0)  # a fetch or tray thread still running would otherwise keep the process alive
 
-    def embed(self, reschedule=True):
-        """Like TrafficMonitor: make our window a child of the taskbar so it lives inside it."""
+    def embed(self, full=True):
+        """Like TrafficMonitor: make our window a child of the taskbar so it lives inside it.
+        Runs at start and on menu Refresh only (no polling). full=False just resizes for new text."""
         u = ctypes.windll.user32
         bar = u.FindWindowW("Shell_TrayWnd", None)
         if bar and u.GetParent(self.hwnd) != bar:
@@ -658,14 +702,27 @@ class App:
             # key on a colour we never draw: the background stays solid (taskbar-coloured), so hovering
             # anywhere on the widget works; transparent key pixels would be click-through
             u.SetLayeredWindowAttributes(self.hwnd, 0x00010203, 0, 1)  # LWA_COLORKEY
+        global BG
+        dpi = u.GetDpiForWindow(bar) if bar and full else self.dpi
+        if dpi and dpi != self.dpi:
+            self.apply_dpi(dpi)
+        bg = taskbar_colour() if full else BG  # the taskbar is translucent: its colour follows the wallpaper
+        if bg != BG:
+            BG = bg
+            for wdg in (self.root, *self.root.winfo_children()):
+                if isinstance(wdg, (tk.Tk, tk.Label)):
+                    wdg.configure(bg=BG)
         w, h = self.root.winfo_reqwidth(), self.root.winfo_reqheight()
         x, y = taskbar_spot(w, h)
         r = wintypes.RECT()
         u.GetWindowRect(bar, ctypes.byref(r))
         u.SetWindowPos(self.hwnd, 0, x - r.left, y - r.top, w, h, 0x0040)  # HWND_TOP, SWP_SHOWWINDOW
         u.RedrawWindow(self.hwnd, None, None, 0x0001 | 0x0004 | 0x0080)  # INVALIDATE|ERASE|ALLCHILDREN
-        if reschedule:
-            self.root.after(5000, self.embed)  # tray width changes; Explorer restarts recreate the taskbar
+
+    def menu_refresh(self):
+        """Menu Refresh: layout too (taskbar, tray width, display scale, colour), then the numbers."""
+        self.embed()
+        self.refresh()
 
     def refresh(self):
         if getattr(self, "_busy", False):  # a click while a refresh is running: let that one finish
@@ -691,16 +748,24 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def click_refresh(self):
-        for h5, wk in self.rows.values():  # dim the numbers until the new ones arrive, so the click is visible
-            h5.config(fg=DIM)
-            wk.config(fg=DIM)
+        for row in self.rows.values():  # dim the numbers until the new ones arrive, so the click is visible
+            for lbl in row:
+                lbl.config(fg=DIM)
         self.refresh()
 
+    def apply_remaining(self):
+        self.save_settings()
+        self.show_numbers()
+
     def show_numbers(self):
-        for key, (h5, wk) in self.rows.items():
+        for key, (t5, h5, tw, wk) in self.rows.items():
             d = self.data.get(key) or {}
-            for lbl, tag, v in ((h5, "5H", d.get("h5")), (wk, "W", d.get("week"))):
-                lbl.config(text=f"{tag} --%" if v is None else f"{tag} {v:.0f}%", fg=color(v))
+            for tag, lbl, v in ((t5, h5, d.get("h5")), (tw, wk, d.get("week"))):
+                lbl.config(text="--%" if v is None else f"{(100 - v if self.cfg['remaining'] else v):.0f}%")
+                for w in (tag, lbl):
+                    w.config(fg=color(v))  # colour always follows % used
+        self.root.update_idletasks()
+        self.embed(full=False)  # width follows the numbers; the right edge stays next to the tray
 
     def update_ui(self, new):
         self._busy = False
@@ -726,13 +791,30 @@ class App:
             self.root.after_cancel(self._timer)
         self._timer = self.root.after(self.v_refresh.get() * 1000, self.refresh)
 
-    def show_tip(self, key):
+    # The popup stays open while the mouse is on the widget or on the popup itself; it closes a moment
+    # after the mouse has left both, so there is time to move from the widget up into the popup.
+    def hover_enter(self):
+        if getattr(self, "_hide_job", None):
+            self.root.after_cancel(self._hide_job)
+            self._hide_job = None
+        if not self.tip:
+            self.show_tip()
+
+    def hover_leave(self):
+        if getattr(self, "_hide_job", None):
+            self.root.after_cancel(self._hide_job)
+        self._hide_job = self.root.after(200, self.hide_tip)
+
+    def show_tip(self):
         self.hide_tip()
         bg, sep = "#202020", "#3a3a3a"
         self.tip = tk.Toplevel(self.root, bg=sep)
         self.tip.overrideredirect(True)
         self.tip.attributes("-topmost", True)
-        mono = ("Consolas", 10)
+        self.tip.bind("<Enter>", lambda e: self.hover_enter())
+        self.tip.bind("<Leave>", lambda e: self.hover_leave())
+        fs = self.cfg["size"]  # popup text follows the widget's Size setting (10 = default)
+        mono = ("Consolas", fs)
         for i, k in enumerate(self.sources):  # all tools side by side in one popup
             d = self.data.get(k)
             segs = popup_segments(k, d, d.get("stats") if d else None)
@@ -740,13 +822,13 @@ class App:
             w = tk.Text(self.tip, bg=bg, fg="#e8e8e8", font=mono, bd=0, highlightthickness=0, padx=14, pady=10,
                         width=max(len(l) for l in text.splitlines() or [""]) + 1, height=text.count("\n") + 1,
                         cursor="arrow")
-            w.tag_configure("title", font=("Segoe UI", 12, "bold"), foreground="#ffffff")
-            w.tag_configure("head", foreground="#8ab4f8", font=("Consolas", 10, "bold"))
+            w.tag_configure("title", font=("Segoe UI", fs + 2, "bold"), foreground="#ffffff")
+            w.tag_configure("head", foreground="#8ab4f8", font=("Consolas", fs, "bold"))
             w.tag_configure("dim", foreground="#9a9a9a")
             w.tag_configure("err", foreground="#ff7b72")
-            w.tag_configure("cost", foreground="#7ee787", font=("Consolas", 10, "bold"))
+            w.tag_configure("cost", foreground="#7ee787", font=("Consolas", fs, "bold"))
             for lvl, c in (("ok", "#7ee787"), ("mid", "#ffb02e"), ("hi", "#ff7b72")):
-                w.tag_configure("pct_" + lvl, foreground=c, font=("Consolas", 10, "bold"))
+                w.tag_configure("pct_" + lvl, foreground=c, font=("Consolas", fs, "bold"))
             for t, tag in segs:
                 w.insert("end", t, tag or ())
             w.configure(state="disabled")
@@ -755,10 +837,11 @@ class App:
         r = wintypes.RECT()  # we are a taskbar child, so ask Windows for our screen position
         ctypes.windll.user32.GetWindowRect(self.hwnd, ctypes.byref(r))
         x = min(r.left, self.root.winfo_screenwidth() - self.tip.winfo_reqwidth() - 4)
-        y = r.top - self.tip.winfo_reqheight() - 12
+        y = r.top - self.tip.winfo_reqheight() - 4  # small gap: quick to cross into the popup
         self.tip.geometry(f"+{x}+{max(0, y)}")
 
     def hide_tip(self):
+        self._hide_job = None
         if self.tip:
             self.tip.destroy()
             self.tip = None
