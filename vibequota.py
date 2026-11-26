@@ -103,7 +103,7 @@ def light_theme() -> bool:
 LIGHT = light_theme()
 FG, DIM = ("#000000", "#707070") if LIGHT else ("#ffffff", "#9a9a9a")
 APP = "VibeQuota"
-VERSION = "1.0.8"  # keep in step with the release tag (1.0.8): the updater compares the two
+VERSION = "1.0.9"  # keep in step with the release tag (1.0.9): the updater compares the two
 REPO = "hiepkhach1005/VibeQuota"
 UPDATE_EVERY_MS = 6 * 3600 * 1000
 
@@ -190,18 +190,24 @@ def period_key(period: str) -> str:
     return f"{datetime.now():%Y-%m-%d}" if period == "today" else f"{datetime.now():%Y-%m}" if period == "month" else ""
 
 
-def load_alerts(key: str) -> list[int]:
+def load_alerts(tool: str, key: str) -> list[int]:
     try:
-        d = json.loads(ALERTS.read_text(encoding="utf-8"))
+        d = json.loads(ALERTS.read_text(encoding="utf-8")).get(tool) or {}
         return list(d.get("levels") or []) if d.get("key") == key else []
     except (OSError, ValueError, AttributeError):
         return []
 
 
-def save_alerts(key: str, levels: list[int]) -> None:
+def save_alerts(tool: str, key: str, levels: list[int]) -> None:
     try:
+        try:
+            d = json.loads(ALERTS.read_text(encoding="utf-8"))
+            d = d if isinstance(d, dict) and "key" not in d else {}  # "key" at the top: the old Codex-only format
+        except (OSError, ValueError):
+            d = {}
+        d[tool] = {"key": key, "levels": levels}
         ALERTS.parent.mkdir(parents=True, exist_ok=True)
-        ALERTS.write_text(json.dumps({"key": key, "levels": levels}), encoding="utf-8")
+        ALERTS.write_text(json.dumps(d), encoding="utf-8")
     except OSError:
         pass
 
@@ -243,6 +249,68 @@ def unlock_codex() -> None:
         os.replace(CODEX_LOCKED, SOURCES["codex"].with_name(f"auth.json.vibequota-backup-{datetime.now():%Y%m%d%H%M%S}"))
     else:
         os.replace(CODEX_LOCKED, SOURCES["codex"])
+
+
+# Claude Code is blocked through its own hook, not by touching its sign-in: Claude Code rewrites
+# .credentials.json when it refreshes the token, and ~/.claude.json holds much more than the key.
+# While its limit is on, ~/.claude/settings.json has one UserPromptSubmit hook; it refuses every prompt
+# (exit code 2, the message is shown to the user) while the flag file below exists, and does nothing otherwise.
+CLAUDE_BLOCK = SETTINGS.with_name("claude_blocked")
+CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
+HOOK_MARK = "vibequota-spending-limit"
+# Claude Code runs hooks with Git Bash on Windows (PowerShell only when Git Bash is missing)
+HOOK_CMD = (f'test -f "{CLAUDE_BLOCK.as_posix()}" && {{ echo "Blocked by the VibeQuota spending limit. '
+            f'Raise or turn off the limit in VibeQuota to continue." >&2; exit 2; }}; exit 0  # {HOOK_MARK}')
+
+
+def claude_locked() -> bool:
+    return CLAUDE_BLOCK.exists()
+
+
+def claude_hook(on: bool) -> None:
+    """Add (on) or remove our hook in ~/.claude/settings.json, leaving everything else as it is.
+    Written only when something changes; an unreadable settings.json is never overwritten."""
+    try:
+        cfg = json.loads(CLAUDE_SETTINGS.read_text(encoding="utf-8-sig"))  # a BOM from a Windows editor is fine
+    except FileNotFoundError:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise ValueError(f"{CLAUDE_SETTINGS.name} is not a JSON object")
+    hooks = cfg.get("hooks") if isinstance(cfg.get("hooks"), dict) else {}
+    groups = [g for g in hooks.get("UserPromptSubmit") or [] if isinstance(g, dict)]
+    ours = [g for g in groups if any(HOOK_MARK in str(h.get("command", "")) for h in g.get("hooks") or [])]
+    if on and ours and all(h.get("command") == HOOK_CMD for g in ours for h in g["hooks"]):
+        return
+    if not on and not ours:
+        return
+    groups = [g for g in groups if g not in ours]
+    if on:
+        groups.append({"hooks": [{"type": "command", "command": HOOK_CMD, "timeout": 10}]})
+    if groups:
+        hooks["UserPromptSubmit"] = groups
+    else:
+        hooks.pop("UserPromptSubmit", None)
+    if hooks:
+        cfg["hooks"] = hooks
+    else:
+        cfg.pop("hooks", None)
+    tmp = CLAUDE_SETTINGS.with_name(CLAUDE_SETTINGS.name + ".vibequota-tmp")
+    CLAUDE_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp, CLAUDE_SETTINGS)
+
+
+def lock_claude(kill: bool) -> None:
+    CLAUDE_BLOCK.parent.mkdir(parents=True, exist_ok=True)
+    CLAUDE_BLOCK.write_text(f"{datetime.now():%Y-%m-%d %H:%M:%S}", encoding="utf-8")
+
+
+def unlock_claude() -> None:
+    CLAUDE_BLOCK.unlink(missing_ok=True)
+
+
+LOCKS = {"codex": (codex_locked, lock_codex, unlock_codex), "claude": (claude_locked, lock_claude, unlock_claude)}
+TOOL_NAME = {"codex": "Codex", "claude": "Claude Code"}
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -957,14 +1025,17 @@ class App:
         set_autostart(cfg["autostart"])
         self.v_autoupdate = tk.BooleanVar(value=cfg["autoupdate"])
         self.hidden = [h for h in cfg.get("hover_hidden") or [] if isinstance(h, str)]
-        saved = cfg.get("codex_limit") or {}
         # only a limit the user saved in the dialog counts; otherwise the current defaults apply
-        self.limit = {**DEFAULT_LIMIT, **saved} if saved.get("set") else {}
-        self.limit_dlg = None
+        self.limits = {}
+        for k in SOURCES:
+            saved = cfg.get(f"{k}_limit") or {}
+            self.limits[k] = {**DEFAULT_LIMIT, **saved} if saved.get("set") else {}
+        self.limit_dlg = {}
         self.settings_dlg = None
         # font, size, %, refresh, start-up, update and hover rows all live in the Settings window
         self.menu.add_command(label="Settings…", command=self.open_settings)
-        self.menu.add_command(label="Codex spending limit…", command=self.open_limit_dialog)
+        self.menu.add_command(label="Codex spending limit…", command=lambda: self.open_limit_dialog("codex"))
+        self.menu.add_command(label="Claude Code spending limit…", command=lambda: self.open_limit_dialog("claude"))
         self.menu.add_separator()
         self.menu.add_command(label=f"VibeQuota v{VERSION}", state="disabled")
         self.menu.add_command(label="Check for updates", command=lambda: self.check_update(manual=True))
@@ -983,7 +1054,8 @@ class App:
             M("Refresh", lambda: self.root.after(0, self.menu_refresh)),
             pystray.Menu.SEPARATOR,
             M("Settings…", lambda: self.root.after(0, self.open_settings)),
-            M("Codex spending limit…", lambda: self.root.after(0, self.open_limit_dialog)),
+            M("Codex spending limit…", lambda: self.root.after(0, lambda: self.open_limit_dialog("codex"))),
+            M("Claude Code spending limit…", lambda: self.root.after(0, lambda: self.open_limit_dialog("claude"))),
             pystray.Menu.SEPARATOR,
             M(f"VibeQuota v{VERSION}", None, enabled=False),
             M("Check for updates", lambda: self.root.after(0, lambda: self.check_update(manual=True))),
@@ -1141,7 +1213,8 @@ class App:
         cfg = {"family": self.v_family.get(), "size": self.v_size.get(), "bold": self.v_bold.get(),
                "italic": self.v_italic.get(), "refresh": self.v_refresh.get(),
                "autostart": self.v_autostart.get(), "autoupdate": self.v_autoupdate.get(),
-               "remaining": self.v_remaining.get(), "codex_limit": dict(self.limit),
+               "remaining": self.v_remaining.get(),
+               **{f"{k}_limit": dict(v) for k, v in self.limits.items()},
                "hover_hidden": list(self.hidden)}
         self.cfg = cfg
         self.tray.update_menu()
@@ -1211,9 +1284,8 @@ class App:
                                  "stats_note": None}
                     except Exception:  # keep the previous table rather than an empty one
                         local = {f: (prev or {}).get(f) for f in ("stats", "stats_at", "stats_note")}
-                    guard = None
-                    if k == "codex":  # limit first: an unblock puts auth.json back before the API is called
-                        guard = self.enforce_limit({"apikey": auth_kind(k) == "apikey", **local})
+                    # limit first: a Codex unblock puts auth.json back before the API is called
+                    guard = self.enforce_limit(k, local)
                     if auth_kind(k) == "apikey":  # no subscription limits to fetch: local stats only
                         new[k] = {"apikey": True, "h5": None, "week": None, "plan": None, "limits": [], "notes": [],
                                   "resets": [], "analytics": None, "error": None,
@@ -1227,11 +1299,11 @@ class App:
                         new[k] = dict(safe(fetchers[k], prev, force))
                         new[k]["apikey"] = False  # signed in: clear a flag left from an API-key setup
                     new[k].update(local)
+                    new[k]["guard"] = guard
                     if k == "codex":
                         err = new[k].get("error") or ""
                         if not new[k].get("apikey") and err and not err.startswith("cached from"):
                             codex_limits_from_log(new[k], err)  # API failed: 5H / Week from the last local request
-                        new[k]["guard"] = guard
                 if extra_codex_files():  # extra Codex sign-ins: own popup column, only when such files exist
                     new["codex_extra"] = {"accounts": fetch_codex_extra(),
                                           "updated": f"{datetime.now():%d/%m %H:%M:%S}"}
@@ -1241,53 +1313,57 @@ class App:
                 self.root.after(0, self.update_ui, new)
         threading.Thread(target=work, daemon=True).start()
 
-    # ---- Codex spending limit (API key only) ----------------------------------------------------
-    def effective_limit(self) -> dict:
+    # ---- spending limits (Codex and Claude Code) ------------------------------------------------
+    def effective_limit(self, key: str) -> dict:
         """The limit the user saved; until then the default: on ($3 a day) with an API key, off with a
-        ChatGPT sign-in (it has its own 5H / weekly limits), which the user can still turn on."""
-        if self.limit.get("set"):
-            return dict(self.limit)
-        return {**DEFAULT_LIMIT, "on": auth_kind("codex") == "apikey"}
+        subscription sign-in (it has its own 5H / weekly limits), which the user can still turn on."""
+        if self.limits[key].get("set"):
+            return dict(self.limits[key])
+        return {**DEFAULT_LIMIT, "on": auth_kind(key) == "apikey"}
 
-    def enforce_limit(self, d: dict) -> dict | None:
-        """Runs on the refresh thread after the local stats: lock Codex when the limit is reached, unlock it
-        when it is not (new day / month, higher limit, limit off). Returns what the widget and hover show."""
-        lim = self.effective_limit()
+    def enforce_limit(self, tool: str, d: dict) -> dict | None:
+        """Runs on the refresh thread after the local stats: block the tool when the limit is reached, unblock
+        it when it is not (new day / month, higher limit, limit off). Returns what the widget and hover show."""
+        lim = self.effective_limit(tool)
+        locked, lock, unlock = LOCKS[tool]
         used = limit_used(d.get("stats"), lim)
         over = bool(lim["on"] and used is not None and used >= lim["value"])
-        was = codex_locked()
+        was = locked()
         err = None
         try:
+            if tool == "claude":  # the hook is there exactly while the limit is on
+                claude_hook(lim["on"])
             if lim["on"] and used is None:
                 pass  # stats not readable this time: keep the current state rather than unlock by mistake
             elif over:
-                if not was or SOURCES["codex"].exists():  # also catches a fresh auth.json made while locked
-                    lock_codex(lim["kill"])
+                if not was or (tool == "codex" and SOURCES["codex"].exists()):  # a fresh auth.json made while locked
+                    lock(lim["kill"])
             elif was:
-                unlock_codex()
-        except OSError as e:
+                unlock()
+        except (OSError, ValueError) as e:
             err = f"{type(e).__name__}: {e}"
-        now = codex_locked()
+        now = locked()
+        name = TOOL_NAME[tool]
         # Warnings as Token Watch does them: each level once per period, remembered across restarts
         # (limit_alerts.json); a new day / month, or a changed limit, starts again.
         if lim["on"] and used is not None:
             pct = 100 * used / lim["value"]
             level_now = max((s for s in (*LIMIT_WARN_STEPS, 100) if pct >= s), default=0)
             key = f"{lim['kind']}|{lim['value']:g}|{lim['period']}|{period_key(lim['period'])}"
-            acked = load_alerts(key)
+            acked = load_alerts(tool, key)
             acked = [a for a in acked if a <= pct]  # rolling 7/30 days fell back under a level: warn again later
             if level_now and level_now not in acked:
                 st = (d.get("stats") or {}).get(lim["period"]) or {}
                 unpriced = " Some usage has no known price, so the real cost is higher." \
                     if lim["kind"] == "cost" and st.get("unpriced") else ""
                 what = "cost" if lim["kind"] == "cost" else "tokens"
-                tail = " Codex is now blocked." if level_now >= 100 else " Codex is blocked at 100%."
-                self.notify(f"Codex · {dict(LIMIT_PERIODS)[lim['period']]} {what} reached {level_now}% — "
+                tail = f" {name} is now blocked." if level_now >= 100 else f" {name} is blocked at 100%."
+                self.notify(f"{name} · {dict(LIMIT_PERIODS)[lim['period']]} {what} reached {level_now}% — "
                             f"{fmt_limit(used, lim['kind'])} / {fmt_limit(lim['value'], lim['kind'])}.{tail}{unpriced}")
                 acked = sorted({*acked, *(s for s in (*LIMIT_WARN_STEPS, 100) if s <= level_now)})
-            save_alerts(key, acked)
+            save_alerts(tool, key, acked)
         if was and not now:
-            self.notify("Codex unblocked.")
+            self.notify(f"{name} unblocked.")
         if not lim["on"] and not now:
             return None
         return {"used": used, "limit": lim["value"], "kind": lim["kind"], "period": lim["period"],
@@ -1335,8 +1411,12 @@ class App:
             row=len(rows) + 1, column=0, columnspan=2, sticky="w", **pad)
         ttk.Checkbutton(wid, text="Auto update", variable=v_upd).grid(
             row=len(rows) + 2, column=0, columnspan=2, sticky="w", **pad)
-        ttk.Button(wid, text="Codex spending limit…", command=self.open_limit_dialog).grid(
-            row=len(rows) + 3, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 10))
+        lims = ttk.Frame(wid)  # one button per tool
+        lims.grid(row=len(rows) + 3, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 10))
+        ttk.Button(lims, text="Codex spending limit…", command=lambda: self.open_limit_dialog("codex")).pack(
+            side="left", padx=(0, 6))
+        ttk.Button(lims, text="Claude Code spending limit…", command=lambda: self.open_limit_dialog("claude")).pack(
+            side="left")
 
         hov = ttk.LabelFrame(dlg, text="Hover shows")
         hov.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=(10, 4))
@@ -1386,14 +1466,16 @@ class App:
                      f"+{(dlg.winfo_screenheight() - dlg.winfo_reqheight()) // 2}")
         dlg.focus_force()
 
-    def open_limit_dialog(self):
-        if self.limit_dlg and self.limit_dlg.winfo_exists():
-            self.limit_dlg.lift()
+    def open_limit_dialog(self, key: str = "codex"):
+        old = self.limit_dlg.get(key)
+        if old and old.winfo_exists():
+            old.lift()
             return
         self.hide_tip()
-        lim = self.effective_limit()
-        dlg = self.limit_dlg = tk.Toplevel(self.root)
-        dlg.title(f"{APP}: Codex spending limit")
+        lim = self.effective_limit(key)
+        name = TOOL_NAME[key]
+        dlg = self.limit_dlg[key] = tk.Toplevel(self.root)
+        dlg.title(f"{APP}: {name} spending limit")
         dlg.attributes("-topmost", True)
         dlg.resizable(False, False)
         pad = {"padx": 10, "pady": 4}
@@ -1402,7 +1484,7 @@ class App:
         v_period = tk.StringVar(value=dict(LIMIT_PERIODS)[lim["period"]])
         v_value = tk.StringVar(value=f"{lim['value']:g}")
         v_kill = tk.BooleanVar(value=lim["kill"])
-        tk.Checkbutton(dlg, text="Block Codex when the limit is reached", variable=v_on).grid(
+        tk.Checkbutton(dlg, text=f"Block {name} when the limit is reached", variable=v_on).grid(
             row=0, column=0, columnspan=3, sticky="w", **pad)
         tk.Label(dlg, text="Count").grid(row=1, column=0, sticky="w", **pad)
         for i, (val, label) in enumerate(LIMIT_KINDS):
@@ -1422,8 +1504,9 @@ class App:
         show_unit()
         # typing a limit means the user wants it: tick "Block Codex" (they can still untick it afterwards)
         v_value.trace_add("write", lambda *_: v_on.set(True) if v_value.get().strip() else None)
-        tk.Checkbutton(dlg, text="Also close running Codex (CLI / app / VS Code) when blocking",
-                       variable=v_kill).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        if key == "codex":  # Claude Code is stopped by its hook at the next prompt: nothing to close
+            tk.Checkbutton(dlg, text="Also close running Codex (CLI / app / VS Code) when blocking",
+                           variable=v_kill).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
         msg = tk.Label(dlg, text="", fg="#c42b1c")
         msg.grid(row=6, column=0, columnspan=3, sticky="w", padx=10)
 
@@ -1435,7 +1518,7 @@ class App:
             except ValueError:
                 msg.config(text="Enter a number above 0.")
                 return
-            self.limit = {"on": v_on.get(), "kind": v_kind.get(), "value": value, "kill": v_kill.get(), "set": True,
+            self.limits[key] = {"on": v_on.get(), "kind": v_kind.get(), "value": value, "kill": v_kill.get(), "set": True,
                           "period": next(k for k, l in LIMIT_PERIODS if l == v_period.get())}
             self.save_settings()
             dlg.destroy()
@@ -1485,11 +1568,11 @@ class App:
     def show_numbers(self):
         for key, (t5, h5, tw, wk) in self.rows.items():
             d = self.data.get(key) or {}
-            if d.get("apikey") or (key == "codex" and (d.get("guard") or {}).get("blocked")):
+            if d.get("apikey") or (d.get("guard") or {}).get("blocked"):
                 # one label across the row instead of 5H / W: API key / spend so far / BLOCKED
                 for w in (h5, tw, wk):
                     w.grid_remove()
-                g = d.get("guard") if key == "codex" else None
+                g = d.get("guard")
                 if g and g["blocked"]:
                     t5.config(text="BLOCKED", fg=color(100))
                 elif g and g["used"] is not None:  # e.g. "$1.20 / $5": colour by share of the limit
@@ -1613,8 +1696,8 @@ class App:
             # scroll by that bit on the mouse wheel: the hover never scrolls
             w.bind("<MouseWheel>", lambda e: "break")
             w.grid(row=0, column=i, sticky="ns", padx=(1 if i == 0 else 0, 1), pady=1)
-            if i < len(self.sources) and self.sources[i] == "codex":
-                self.add_bell(w, bg, fs)
+            if i < len(self.sources):  # every tool's column has its spending-limit bell
+                self.add_bell(self.sources[i], w, bg, fs)
         self.tip.update_idletasks()
         r = wintypes.RECT()  # we are a taskbar child, so ask Windows for our screen position
         ctypes.windll.user32.GetWindowRect(self.hwnd, ctypes.byref(r))
@@ -1622,11 +1705,11 @@ class App:
         y = r.top - self.tip.winfo_reqheight() - 4  # small gap: quick to cross into the popup
         self.tip.geometry(f"+{x}+{max(0, y)}")
 
-    def add_bell(self, w, bg, fs):
-        """Big bell at the top right of the Codex column: opens the spending limit. Its colour is the state:
+    def add_bell(self, key, w, bg, fs):
+        """Small bell at the top right of a tool's column: opens its spending limit. Its colour is the state:
         grey off, green under 80%, orange from 80%, red when blocked."""
-        g = (self.data.get("codex") or {}).get("guard")
-        if not (g and (g["blocked"] or self.effective_limit()["on"])):
+        g = (self.data.get(key) or {}).get("guard")
+        if not (g and (g["blocked"] or self.effective_limit(key)["on"])):
             fg, hint = "#9a9a9a", "Spending limit off"
         elif g and g["blocked"]:
             fg, hint = "#ff7b72", "Blocked"
@@ -1642,7 +1725,7 @@ class App:
                  cursor="hand2").pack(side="left")
         box.place(relx=1.0, x=-14, y=12, anchor="ne")
         for x in (box, *box.winfo_children()):
-            x.bind("<Button-1>", lambda e: self.open_limit_dialog())
+            x.bind("<Button-1>", lambda e: self.open_limit_dialog(key))
 
     def reset_click(self, tag: str):
         """[Use] asks inside the hover, [Yes] spends the reset in the background, [No] cancels."""

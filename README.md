@@ -8,6 +8,8 @@ A small widget that lives **inside the Windows 11 taskbar** and shows how much o
 [Claude icon] 5H 94%   W 43%
 ```
 
+![The hover: Codex and Claude Code side by side](docs/hover.png)
+
 - **5H**: % used of the 5-hour window. **W**: % used of the weekly limit.
   Green below 70%, orange from 70%, red from 90%.
 - **Hover**: details for both tools side by side:
@@ -23,7 +25,7 @@ A small widget that lives **inside the Windows 11 taskbar** and shows how much o
 - **Click**: refresh now. This also checks the sign-ins again, so a tool you just signed in to
   (or out of) appears (or disappears) without a restart.
 - **Right-click** (widget or tray icon): Refresh, **Settings…**, **Codex spending limit…**,
-  Check for updates, Exit.
+  **Claude Code spending limit…**, Check for updates, Exit.
 - A row is only shown when that tool is signed in on the machine or has an API key. With neither,
   the widget reads *No Codex / Claude sign-in*. With an API key instead of a subscription sign-in
   there are no 5H / W limits: the row reads **API key** (or the spending limit, see below) and the
@@ -35,9 +37,11 @@ A small widget that lives **inside the Windows 11 taskbar** and shows how much o
 
 Right-click → **Settings…** opens one window. Changes apply on **OK**.
 
+![Settings window](docs/settings.png)
+
 - **Widget**: font, size, bold, italic; show *Used %* or *Remaining %*; refresh interval (1 to
   30 min, default 1 min; Claude quota at most every 3 to 3.5 min to avoid rate limits, unless you
-  click); start with Windows; auto update; a button for the Codex spending limit.
+  click); start with Windows; auto update; buttons for the Codex and Claude Code spending limits.
 - **Hover shows**: turn each block on or off (local table, server table, Model, Top tools), and
   pick the rows of the local table and of the server table separately. By default the local table
   shows every row and the server table shows only *Lines added* and *Total tokens*.
@@ -50,24 +54,49 @@ When an account has limit resets (Codex reset credits, Claude's monthly full res
 extension does, and then the limits refresh. The result, or the reason it failed, is shown under the list.
 A used reset cannot be given back. A Claude reset that Claude marks as not usable right now has no button.
 
-## Codex spending limit
+## Spending limits (Codex and Claude Code)
 
-Right-click → **Codex spending limit…** (or the small bell at the top right of the Codex hover) sets a
-limit for Codex, by estimated cost (USD) or by tokens, for today, this month, the last 7 days or the
-last 30 days. With an API key it is on by default at **$3 a day**; with a ChatGPT sign-in it is off
-by default and can be turned on. Typing a value ticks *Block Codex when the limit is reached*. The
-row then shows `$1.20 / $3` and the hover shows how much of the limit is used; the bell's colour
-follows it (grey off, green, orange from 80%, red when blocked).
+Each tool has its own limit. Open it with the small bell at the top right of that tool's hover column,
+or right-click → **Codex spending limit…** / **Claude Code spending limit…**. A limit counts estimated
+cost (USD) or tokens, for today, this month, the last 7 days or the last 30 days.
+
+![Claude Code spending limit](docs/limit.png)
+
+- With an API key a limit is on by default at **$3 a day**. With a subscription sign-in (ChatGPT,
+  Claude Pro / Max) it is off by default, since those plans have their own 5H / weekly limits and the
+  cost is only an estimate; it can still be turned on.
+- Typing a value ticks *Block … when the limit is reached*.
+- The row then shows `$1.20 / $3` and the hover shows how much of the limit is used. The bell's colour
+  follows it: grey off, green, orange from 80%, red when blocked.
 
 A tray notification warns at 80%, 85%, 90%, 95% and 100% of the limit, as Token Watch's cost alerts
 do: each level once per period (remembered across restarts in `limit_alerts.json`), starting again on
 a new day or month or when the limit changes, and noting when some usage has no known price.
+
+Usage is estimated from this machine's logs only and checked at each refresh, so it can go a little
+over before the block. A limit is a guard against overspending, not a security control.
+
+### Codex
+
 When the limit is reached, VibeQuota moves `~/.codex/auth.json` aside to
 `auth.json.vibequota-locked` (and, if ticked, closes running `codex.exe`), so Codex has no key; the row
 reads **BLOCKED**. When usage is under the limit again (a new day or month, a higher limit, or the limit
-turned off) the file is put back. Usage is estimated from this machine's logs only and checked at each
-refresh, so it can go a little over before the block. It is a guard against overspending, not a
-security control: a key in the `OPENAI_API_KEY` environment variable is not blocked.
+turned off) the file is put back. A key in the `OPENAI_API_KEY` environment variable is not blocked.
+
+### Claude Code
+
+Claude Code's sign-in is left alone (Claude Code rewrites it when it refreshes its token). Instead,
+while the Claude Code limit is on, VibeQuota adds one `UserPromptSubmit` hook to
+`~/.claude/settings.json` and removes it when the limit is turned off; other settings and hooks are
+kept. When the limit is reached VibeQuota creates `%APPDATA%\VibeQuota\claude_blocked`, and while
+that file exists the hook refuses every prompt with *Blocked by the VibeQuota spending limit*. When
+usage is under the limit again the file is deleted.
+
+- The hook runs with Git Bash, which Claude Code on Windows normally uses. Without Git Bash it does not block.
+- A Claude Code session that was already open may need a restart to pick up the hook the first time.
+- An answer that is already running is not stopped; the block applies from the next prompt.
+- If VibeQuota is closed while blocked, Claude Code stays blocked until VibeQuota runs again and
+  finds usage under the limit (or you delete that file).
 
 ## Several Codex accounts
 
@@ -114,7 +143,8 @@ over 272K tokens. Its pricing table follows the
 VibeQuota reads the sign-in that the Codex CLI (`~/.codex/auth.json`) and Claude Code
 (`~/.claude/.credentials.json`) already store. It never refreshes or writes those tokens: if one
 expires, use the CLI once and the next refresh picks up the new token. It only writes Codex's
-sign-in files when you switch accounts or when the spending limit blocks and unblocks Codex.
+sign-in files when you switch accounts or when the spending limit blocks and unblocks Codex,
+and Claude Code's `settings.json` only to add or remove the spending-limit hook.
 Nothing is sent anywhere except to those two providers' own APIs.
 
 The endpoints are **undocumented** and can change without notice.
