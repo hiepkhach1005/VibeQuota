@@ -175,9 +175,3 @@ The updater only sees releases of a **public** repository, and it ignores drafts
 ## License
 
 [MIT](LICENSE)
-
-## How it sits in the taskbar
-
-As [TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor) does on Windows 11, the window
-is made a child of `Shell_TrayWnd` with `WS_EX_LAYERED`. It is placed just left of
-`TrayNotifyWnd` and re-positioned every 5 seconds.
