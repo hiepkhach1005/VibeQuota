@@ -172,6 +172,10 @@ Or run it directly with `pythonw vibequota.py` after `pip install -r requirement
 Installed copies pick it up within 6 hours, or straight away with **Check for updates**.
 The updater only sees releases of a **public** repository, and it ignores drafts and pre-releases.
 
+## License
+
+[MIT](LICENSE)
+
 ## How it sits in the taskbar
 
 As [TrafficMonitor](https://github.com/zhongyang219/TrafficMonitor) does on Windows 11, the window
