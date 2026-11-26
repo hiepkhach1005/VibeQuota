@@ -12,6 +12,9 @@ import base64
 import ctypes
 import json
 import os
+import random
+import re
+import shutil
 import sys
 import subprocess
 import threading
@@ -26,15 +29,66 @@ from PIL import Image, ImageTk
 
 import usage_stats
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 ctypes.windll.shcore.SetProcessDpiAwareness(2)  # real pixels, so the widget lands on the taskbar
 
 HOME = Path.home()
 ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "assets"
-SOURCES = {"codex": HOME / ".codex" / "auth.json", "claude": HOME / ".claude" / ".credentials.json"}
+CODEX_HOME = Path(usage_stats.codex_home())  # $CODEX_HOME or ~/.codex
+CLAUDE_DIR = Path(usage_stats.claude_dir())  # $CLAUDE_CONFIG_DIR or ~/.claude
+# Claude Code keeps .claude.json inside CLAUDE_CONFIG_DIR when that is set, else next to ~/.claude
+CLAUDE_JSON = CLAUDE_DIR / ".claude.json" if os.environ.get("CLAUDE_CONFIG_DIR") else HOME / ".claude.json"
+SOURCES = {"codex": CODEX_HOME / "auth.json", "claude": CLAUDE_DIR / ".credentials.json"}
+LOGS = {"codex": CODEX_HOME / "sessions", "claude": CLAUDE_DIR / "projects"}
+
+
+CODEX_LOCKED = SOURCES["codex"].with_name("auth.json.vibequota-locked")  # auth.json moved aside while over the limit
+
+
+def auth_kind(key: str) -> str | None:
+    """'plan' (subscription sign-in: limits available), 'apikey' (only local log stats) or None (not used here).
+    Like Token Watch: Codex with auth_mode other than "chatgpt", or no sign-in token, counts as an API key.
+    While VibeQuota has locked Codex the sign-in lives in CODEX_LOCKED, so that file decides.
+    Not signed in and no API key anywhere: None, so the tool is not shown (old logs alone do not count)."""
+    src = SOURCES[key]
+    if key == "codex" and not src.exists() and CODEX_LOCKED.exists():
+        src = CODEX_LOCKED
+    has_key = any(os.environ.get(v) for v in (("OPENAI_API_KEY", "CODEX_API_KEY") if key == "codex"
+                                                 else ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")))
+    try:
+        d = json.loads(src.read_text(encoding="utf-8"))
+        if key == "codex":
+            if d.get("auth_mode") in (None, "chatgpt") and (d.get("tokens") or {}).get("access_token"):
+                return "plan"
+            has_key = has_key or bool(d.get("OPENAI_API_KEY"))
+        elif (d.get("claudeAiOauth") or {}).get("accessToken"):
+            return "plan"
+    except (OSError, ValueError, AttributeError):
+        pass
+    if key == "claude" and not has_key:
+        has_key = claude_api_key_configured()
+    return "apikey" if has_key else None
+
+
+def claude_api_key_configured() -> bool:
+    """Claude Code with an API key: `primaryApiKey` in ~/.claude.json, or an API key / helper in its settings."""
+    try:
+        if json.loads(CLAUDE_JSON.read_text(encoding="utf-8")).get("primaryApiKey"):
+            return True
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        s = json.loads((CLAUDE_DIR / "settings.json").read_text(encoding="utf-8"))
+        env = s.get("env") or {}
+        return bool(s.get("apiKeyHelper") or env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"))
+    except (OSError, ValueError, AttributeError):
+        return False
 
 
 def light_theme() -> bool:
@@ -49,7 +103,7 @@ def light_theme() -> bool:
 LIGHT = light_theme()
 FG, DIM = ("#000000", "#707070") if LIGHT else ("#ffffff", "#9a9a9a")
 APP = "VibeQuota"
-VERSION = "1.0.3"  # keep in step with the release tag (v1.0.3): the updater compares the two
+VERSION = "1.0.8"  # keep in step with the release tag (1.0.8): the updater compares the two
 REPO = "hiepkhach1005/VibeQuota"
 UPDATE_EVERY_MS = 6 * 3600 * 1000
 
@@ -109,8 +163,88 @@ if OLD_DIR.is_dir() and not SETTINGS.parent.exists():
         pass
 CACHE = SETTINGS.with_name("last_quota.json")  # last good quota per tool, shown at start-up until a fetch works
 DEFAULT_FONT = {"family": "Tahoma", "size": 10, "bold": False, "italic": False,
-                "refresh": 60,  # seconds; Token Watch also refreshes quota every minute
-                "autostart": True, "autoupdate": True, "remaining": False}
+                "refresh": 60,  # seconds; Claude quota is fetched less often, see CLAUDE_EVERY
+                "autostart": True, "autoupdate": True, "remaining": False,
+                # hover rows / blocks turned off in Settings; by default the server table shows only lines added and tokens
+                "hover_hidden": ["server:Messages", "server:Lines removed", "server:Threads", "server:Input",
+                                 "server:Output", "server:Cache read"]}
+# What the Settings window can hide in the hover, chosen apart for each table: saved as "local:<row>" / "server:<row>"
+HOVER_ROWS = ("Messages", "Lines added", "Lines removed", "Sessions", "Requests", "Tool calls", "Input", "Output",
+              "Cache read", "Cache write", "Total tokens", "Cost")
+HOVER_SERVER_ROWS = ("Messages", "Lines added", "Lines removed", "Threads", "Input", "Output", "Cache read",
+                     "Total tokens")  # what Codex Analytics reports
+HOVER_BLOCKS = (("local", "This machine (local logs) table"), ("server", "Account (server) table"),
+                ("models", "Model (7 days)"), ("tools", "Top tools (7 days)"))
+# Spending limit for Codex with an API key (no subscription limits there): over it, Codex is locked out
+DEFAULT_LIMIT = {"on": True, "kind": "cost", "period": "today", "value": 3.0, "kill": True}  # $3 a day until changed
+LIMIT_PERIODS = [("today", "Today"), ("month", "This month"), ("7d", "Last 7 days"), ("30d", "Last 30 days")]
+LIMIT_WARN_STEPS = (80, 85, 90, 95)  # % of the limit that shows a tray notification; 100% blocks
+LIMIT_KINDS = [("cost", "Cost (USD)"), ("tokens", "Tokens")]
+
+
+ALERTS = SETTINGS.with_name("limit_alerts.json")  # warning levels already shown, for the current period
+
+
+def period_key(period: str) -> str:
+    """Today -> 2026-11-26, This month -> 2026-11; rolling windows have no boundary (they re-arm by falling under)."""
+    return f"{datetime.now():%Y-%m-%d}" if period == "today" else f"{datetime.now():%Y-%m}" if period == "month" else ""
+
+
+def load_alerts(key: str) -> list[int]:
+    try:
+        d = json.loads(ALERTS.read_text(encoding="utf-8"))
+        return list(d.get("levels") or []) if d.get("key") == key else []
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def save_alerts(key: str, levels: list[int]) -> None:
+    try:
+        ALERTS.parent.mkdir(parents=True, exist_ok=True)
+        ALERTS.write_text(json.dumps({"key": key, "levels": levels}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def limit_used(st: dict | None, lim: dict) -> float | None:
+    """What counts against the limit in its period: estimated cost, or all tokens (input, output, cache)."""
+    r = (st or {}).get(lim["period"])
+    if not r:
+        return None
+    return r["cost_usd"] if lim["kind"] == "cost" else r["total"]
+
+
+def fmt_limit(v: float, kind: str) -> str:
+    return f"${v:,.2f}" if kind == "cost" else human(v)
+
+
+def codex_locked() -> bool:
+    return CODEX_LOCKED.exists()
+
+
+def lock_codex(kill: bool) -> None:
+    """Move ~/.codex/auth.json aside so Codex has no API key, and optionally stop running Codex processes
+    (a running Codex keeps the key in memory). Codex signed in again meanwhile: move that file aside too."""
+    src = SOURCES["codex"]
+    if src.exists():
+        dst = CODEX_LOCKED if not CODEX_LOCKED.exists() else \
+            src.with_name(f"auth.json.vibequota-locked-{datetime.now():%Y%m%d%H%M%S}")
+        os.replace(src, dst)
+    if kill:
+        subprocess.run(["taskkill", "/F", "/IM", "codex.exe"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def unlock_codex() -> None:
+    """Put the key back. If Codex has made a new auth.json meanwhile, that one wins and ours is kept as a backup."""
+    if not CODEX_LOCKED.exists():
+        return
+    if SOURCES["codex"].exists():
+        os.replace(CODEX_LOCKED, SOURCES["codex"].with_name(f"auth.json.vibequota-backup-{datetime.now():%Y%m%d%H%M%S}"))
+    else:
+        os.replace(CODEX_LOCKED, SOURCES["codex"])
+
+
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
@@ -197,7 +331,7 @@ def claude_cli_version() -> str:
 
 
 def codex_auth() -> dict:
-    return json.loads((HOME / ".codex" / "auth.json").read_text(encoding="utf-8"))["tokens"]
+    return json.loads((CODEX_HOME / "auth.json").read_text(encoding="utf-8"))["tokens"]
 
 
 def codex_headers(t: dict) -> dict:
@@ -209,13 +343,13 @@ def codex_account() -> str:
     try:
         claims = json.loads(base64.urlsafe_b64decode(codex_auth()["id_token"].split(".")[1] + "=="))
         return claims.get("email", "?")
-    except (OSError, ValueError, KeyError, IndexError):
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
         return "?"
 
 
 def claude_account() -> str:
     try:
-        return (json.loads((HOME / ".claude.json").read_text(encoding="utf-8")).get("oauthAccount") or {}).get(
+        return (json.loads(CLAUDE_JSON.read_text(encoding="utf-8")).get("oauthAccount") or {}).get(
             "emailAddress", "?")
     except (OSError, ValueError):
         return "?"
@@ -240,19 +374,212 @@ def fetch_codex() -> dict:
             avail = [c for c in cr.get("credits") or [] if c and c.get("status") == "available"]
         except (urllib.error.URLError, ValueError):
             avail = []
-        r["resets"] = [(c.get("title") or "Reset", 1, fmt_time(c.get("expires_at")))
+        # 4th item: the credit id that the [Use] button spends (None: nothing to spend from here)
+        r["resets"] = [(c.get("title") or "Reset", 1, fmt_time(c.get("expires_at")), c.get("id"))
                        for c in sorted(avail, key=lambda c: str(c.get("expires_at") or ""))]
         if not r["resets"]:
-            r["resets"] = [("Reset", d["rate_limit_reset_credits"]["available_count"], "-")]
+            r["resets"] = [("Reset", d["rate_limit_reset_credits"]["available_count"], "-", None)]
     r["analytics"] = codex_analytics(t)
     return r
+
+
+def codex_limits_from_log(r: dict, api_error: str) -> bool:
+    """When the usage API fails (offline, expired token, 429): 5H / Week from the rate_limits that Codex wrote
+    with its last request on this machine, instead of --% or an error. A window whose reset time has passed
+    reads 0%. Not live: use on other machines or the cloud since then is not in it."""
+    snap = usage_stats.codex_rate_limits()
+    if not snap:
+        return False
+    ts, rl = snap
+    if api_error.startswith("from local log"):  # kept from an earlier refresh: keep the API's reason
+        api_error = api_error.split(" · API: ", 1)[-1]
+    now = time.time()
+    vals = {}
+    for key, label in (("primary", "5H"), ("secondary", "Week")):
+        w = rl.get(key) or {}
+        pct, reset = w.get("used_percent"), w.get("resets_at")
+        if pct is not None and reset and reset < now:
+            pct = 0.0  # that window has reset since the log was written
+        vals[label] = (pct, fmt_time(reset) if reset else "-")
+    r["h5"], r["week"] = vals["5H"][0], vals["Week"][0]
+    r["limits"] = [(label, pct, reset) for label, (pct, reset) in vals.items() if pct is not None]
+    r["plan"] = r.get("plan") or rl.get("plan_type")
+    r["error"] = f"from local log at {datetime.fromtimestamp(ts):%d/%m %H:%M} · API: {api_error}"
+    return True
+
+
+def codex_auth_type(p: Path) -> str | None:
+    """What a JSON file shaped like Codex's auth.json holds, whatever it is called: 'plan' for a ChatGPT
+    sign-in {"tokens": {"access_token", "id_token" or "refresh_token"}}, 'apikey' for {"OPENAI_API_KEY": "sk-..."},
+    else None. Big files are not sign-ins."""
+    try:
+        if p.stat().st_size > 256 * 1024:
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        t = d.get("tokens") or {}
+        if isinstance(t, dict) and t.get("access_token") and (t.get("id_token") or t.get("refresh_token")):
+            return "plan"
+        k = d.get("OPENAI_API_KEY")
+        if isinstance(k, str) and k.strip():
+            return "apikey"
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def is_codex_auth(p: Path) -> bool:
+    return codex_auth_type(p) is not None
+
+
+def api_key_tail(p: Path) -> str:
+    """Last 4 characters of the key in an API-key auth file: enough to tell keys apart, never the key."""
+    try:
+        k = json.loads(p.read_text(encoding="utf-8")).get("OPENAI_API_KEY") or ""
+        return re.sub(r"[^\w]", "", k.strip())[-4:]
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def extra_codex_files() -> list[Path]:
+    """Other saved Codex sign-ins: any *.json directly in ~/.codex (not its sub-folders, so auth_backup is
+    left out) whose content looks like auth.json. Only read, never renamed or written."""
+    codex = CODEX_HOME
+    return [p for p in sorted(codex.glob("*.json"))
+            if p.is_file() and p.name.lower() != "auth.json" and is_codex_auth(p)]
+
+
+def codex_file_label(name: str) -> str:
+    """auth_work.json -> work, my-acc.json -> my-acc"""
+    stem = Path(name).stem
+    return stem.removeprefix("auth_") or stem
+
+
+def fetch_codex_extra() -> list[dict]:
+    """5H / Week for each extra Codex sign-in; one failing file never hides the others."""
+    main = codex_account()
+    cur = CODEX_HOME / "auth.json"
+    main_key = api_key_tail(cur) if codex_auth_type(cur) == "apikey" else None  # same key as auth.json: skip
+    out, seen = [], set()
+    for f in extra_codex_files():
+        r = {"file": f.name, "label": codex_file_label(f.name), "email": "?", "plan": None, "limits": [],
+             "error": None, "expired": False}
+        if codex_auth_type(f) == "apikey":  # no quota to fetch: listed so Codex can be switched back to the key
+            tail = api_key_tail(f)
+            if ("apikey", tail) in seen or (main_key and tail == main_key):
+                continue
+            seen.add(("apikey", tail))
+            r.update(apikey=True, email=f"API key …{tail}" if tail else "API key")
+            out.append(r)
+            continue
+        try:
+            t = json.loads(f.read_text(encoding="utf-8"))["tokens"]
+            try:
+                r["email"] = json.loads(base64.urlsafe_b64decode(t["id_token"].split(".")[1] + "==")).get("email", "?")
+            except (ValueError, KeyError, IndexError, TypeError):
+                pass
+            if r["email"] != "?" and (r["email"] == main or r["email"] in seen):  # shown already (auth.json / copy)
+                continue
+            seen.add(r["email"])
+            d = get_json("https://chatgpt.com/backend-api/wham/usage", codex_headers(t))
+            rl = d.get("rate_limit") or {}
+            p, s = rl.get("primary_window") or {}, rl.get("secondary_window") or {}
+            r["plan"] = d.get("plan_type")
+            r["limits"] = [(n, w.get("used_percent"), fmt_time(w.get("reset_at")))
+                           for n, w in (("5H", p), ("Week", s)) if w.get("used_percent") is not None]
+            n = (d.get("rate_limit_reset_credits") or {}).get("available_count") or 0
+            r["resets"] = []
+            if n:  # same as the main Codex column: list each available reset credit
+                try:
+                    cr = get_json("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits", codex_headers(t))
+                    avail = [c for c in cr.get("credits") or [] if c and c.get("status") == "available"]
+                except (urllib.error.URLError, ValueError):
+                    avail = []
+                r["resets"] = [(c.get("title") or "Reset", 1, fmt_time(c.get("expires_at")))
+                               for c in sorted(avail, key=lambda c: str(c.get("expires_at") or ""))] \
+                    or [("Reset", n, "-")]
+        except urllib.error.HTTPError as e:
+            r["expired"] = e.code == 401  # can still be switched to: Codex renews the token or asks to sign in
+            r["error"] = {401: "token expired (sign in again)", 429: "rate limited"}.get(e.code, f"HTTP {e.code}")
+        except Exception as e:
+            r["error"] = f"{type(e).__name__}: {e}"
+        out.append(r)
+    return out
+
+
+def switch_codex_account(name: str) -> str:
+    """auth.json -> auth_<current user>.json, then <name> (any sign-in file found in ~/.codex) -> auth.json.
+    Both backed up first; never overwrites a file. Returns the file name the old account was saved as."""
+    codex = CODEX_HOME
+    cur, new = codex / "auth.json", codex / name
+    if new not in extra_codex_files():  # only a file we listed: no paths from elsewhere, nothing that is not a sign-in
+        raise FileNotFoundError(name)
+    if cur.exists() and codex_auth_type(cur) == "apikey":  # an API key: name it so it is clearly the key
+        base = "apikey" + (f"_{api_key_tail(cur)}" if api_key_tail(cur) else "")
+    else:
+        base = re.sub(r"[^\w.-]", "_", codex_account().split("@")[0]) if codex_account() != "?" else "old"
+    old = codex / f"auth_{base}.json"
+    i = 2
+    while old.exists():
+        old = codex / f"auth_{base}_{i}.json"
+        i += 1
+    bak = codex / "auth_backup" / f"{datetime.now():%Y%m%d_%H%M%S}"
+    bak.mkdir(parents=True, exist_ok=True)
+    if cur.exists():
+        shutil.copy2(cur, bak / cur.name)
+    shutil.copy2(new, bak / new.name)
+    if cur.exists():
+        cur.rename(old)
+    try:
+        new.rename(cur)
+    except OSError:
+        if old.exists() and not cur.exists():
+            old.rename(cur)  # put the old sign-in back
+        raise
+    _analytics_cache.update(at=0.0, rows=None)  # analytics belong to the previous account
+    return old.name
+
+
+def codex_extra_segments(accts: list[dict], updated: str | None) -> list[tuple[str, str]]:
+    out = []
+
+    def line(*parts):
+        out.extend(parts)
+        out.append(("\n", ""))
+
+    line(("Codex accounts", "title"))
+    line(("", ""))
+    for a in accts:
+        line((a.get("label") or codex_file_label(a["file"]), "head"), (f"  {a['email']}", "dim"), (f"  {a['plan']}" if a.get("plan") else "", "dim"),
+             *([("  ", ""), ("[Switch]", "switch:" + a["file"])]
+               if a.get("apikey") or a.get("expired") or (a.get("limits") and not a.get("error")) else []))
+        if a.get("apikey"):
+            line(("  No usage limits (API key)", "dim"))
+        if a.get("error"):
+            line(("  ! " + a["error"], "err"))
+        if a.get("limits"):
+            line((f"  {'Limit':<6}{'Used':>6}{'Left':>7}   {'Resets at':<12}", "dim"))
+            for label, pct, reset in a["limits"]:
+                line((f"  {label:<6}", ""), (f"{pct:>5.0f}%", "pct_" + level(pct)),
+                     (f"{100 - pct:>6.0f}%", "pct_" + level(pct)), (f"   {reset:<12}", ""))
+        if a.get("limits") or a.get("resets"):
+            resets = a.get("resets") or []
+            if resets:
+                line((f"  {'Limit resets':<26}{'Left':>5}   {'Expires':<12}", "dim"))
+                for title, count, exp in resets:
+                    line((f"  {title[:26]:<26}{count:>5}   {exp:<12}", ""))
+            elif not a.get("error"):
+                line(("  Limit resets: none", "dim"))
+        line(("", ""))
+    if updated:
+        line((f"Updated {updated}", "dim"))
+    return out
 
 
 _analytics_cache = {"at": 0.0, "rows": None}
 
 
 def codex_analytics(t: dict):
-    """Messages and lines of code, as on the Codex app's Settings > Analytics page. Daily data, so cached 10 min."""
+    """Messages, lines of code, threads and tokens of the whole account (every machine and cloud), as on the Codex app's Settings > Analytics page. Daily data, so cached 10 min."""
     if time.time() - _analytics_cache["at"] < 600:
         return _analytics_cache["rows"]
     today = datetime.now().date()
@@ -264,7 +591,7 @@ def codex_analytics(t: dict):
             q = f"start_date={end - timedelta(days=364)}&end_date={end}"
             got_t = get_json(base + "daily-workspace-usage-counts?" + q, codex_headers(t)).get("data") or []
             got_l = get_json(base + "code-attribution?" + q, codex_headers(t)).get("data") or []
-            turns.update({r["date"]: (r.get("totals") or {}).get("turns") or 0 for r in got_t})
+            turns.update({r["date"]: r.get("totals") or {} for r in got_t})
             loc.update({r["date"]: ((r.get("code_attribution") or {}).get("lines_of_code") or {}) for r in got_l})
             if not got_t and not got_l:
                 break
@@ -277,9 +604,15 @@ def codex_analytics(t: dict):
                   str(today.replace(month=1, day=1)), ""]
         return [sum(value(v) for day, v in src.items() if day >= f) for f in firsts]
 
-    rows = [("Messages", series(turns, lambda v: v)),
+    def total(field):
+        return series(turns, lambda v: v.get(field) or 0)
+
+    rows = [("Messages", total("turns")),
             ("Lines added", series(loc, lambda v: v.get("added") or 0)),
-            ("Lines removed", series(loc, lambda v: v.get("removed") or 0))]
+            ("Lines removed", series(loc, lambda v: v.get("removed") or 0)),
+            ("Threads", total("threads")),  # summed per day: a thread used on two days counts twice
+            ("Input", total("uncached_text_input_tokens")), ("Output", total("text_output_tokens")),
+            ("Cache read", total("cached_text_input_tokens")), ("Total tokens", total("text_total_tokens"))]
     _analytics_cache.update(at=time.time(), rows=rows)
     return rows
 
@@ -288,8 +621,44 @@ CLAUDE_LABELS = {"five_hour": "5H", "seven_day": "Week", "seven_day_opus": "Week
                  "seven_day_sonnet": "Week Sonnet"}
 
 
+def post_json(url: str, headers: dict, body: dict) -> dict:
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
+                                 headers={**headers, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:200].decode("utf-8", "replace").strip()
+        raise RuntimeError(f"HTTP {e.code}{': ' + detail if detail else ''}") from None
+    try:
+        return json.loads(raw or b"{}")
+    except ValueError:
+        return {}
+
+
+def use_limit_reset(key: str, reset_id: str) -> None:
+    """Spend one usage-limit reset, the same calls Token Watch makes. Raises with a short reason on failure."""
+    if key == "codex":
+        t = codex_auth()
+        post_json("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", codex_headers(t),
+                  {"credit_id": reset_id, "redeem_request_id": str(uuid.uuid4())})
+        return
+    o = json.loads((CLAUDE_DIR / ".credentials.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+    h = {"Authorization": f"Bearer {o['accessToken']}", "Accept": "application/json",
+         "anthropic-beta": "oauth-2025-04-20", "User-Agent": f"claude-cli/{claude_cli_version()} (external, cli)",
+         "x-app": "cli"}
+    org = ((get_json("https://api.anthropic.com/api/oauth/profile", h).get("organization") or {}).get("uuid") or "")
+    if not org.strip():
+        raise RuntimeError("the Claude account is not in an organization")
+    res = post_json(f"https://api.anthropic.com/api/organizations/{urllib.parse.quote(org.strip())}/reset_rate_limits",
+                    h, {"program": "cedar_ember", "grant_id": reset_id, "request_id": str(uuid.uuid4())})
+    if res.get("result") != "reset":
+        raise RuntimeError(f"Claude did not apply it: {res.get('result', 'unreadable answer, it may have been applied')}"
+                           + (f" ({res['reason']})" if res.get("reason") else ""))
+
+
 def fetch_claude() -> dict:
-    o = json.loads((HOME / ".claude" / ".credentials.json").read_text(encoding="utf-8"))["claudeAiOauth"]
+    o = json.loads((CLAUDE_DIR / ".credentials.json").read_text(encoding="utf-8"))["claudeAiOauth"]
     # Same request as Token Watch: cedar_ember=1 asks for the usage-limit resets, x-app/user-agent mark a CLI client
     d = get_json("https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1", {
         "Authorization": f"Bearer {o['accessToken']}", "anthropic-beta": "oauth-2025-04-20",
@@ -325,7 +694,9 @@ def fetch_claude() -> dict:
         r["notes"].append(f"Extra usage: {extra.get('used_credits')} / {extra.get('monthly_limit')}")
     ce = d.get("cedar_ember") or {}  # usage-limit resets
     grants = [g for g in ce.get("grants") or [] if g and not g.get("paused") and (g.get("resets_left") or 0) > 0]
-    r["resets"] = [(g.get("label") or "Reset", g["resets_left"], fmt_time(g.get("ends_at")))
+    # 4th item: the grant id for [Use]; None when Claude says it cannot be used right now (as Token Watch reads it)
+    r["resets"] = [(g.get("label") or "Reset", g["resets_left"], fmt_time(g.get("ends_at")),
+                    g.get("id") if g.get("usable_now") is True else None)
                    for g in sorted(grants, key=lambda g: str(g.get("ends_at") or ""))]
     if not grants and ce.get("eligible") is False:
         r["notes"].append(f"Limit resets: not eligible ({ce.get('ineligible_reason', '?')})")
@@ -335,9 +706,28 @@ def fetch_claude() -> dict:
 
 
 BACKOFF: dict = {}  # fn -> (skip-until timestamp, consecutive 429 count)
+BACKOFF_STEPS = (180, 360, 720, 900)  # seconds, per consecutive 429 (same as Token Watch)
+CLAUDE_EVERY = (180, 210)  # seconds, random in between: Claude rate-limits faster polling (same as Token Watch)
+NEXT_FETCH: dict = {}  # fn -> earliest automatic fetch, set after a success
 
 
-def safe(fn, prev: dict | None) -> dict:
+def retry_after(value: str | None) -> float:
+    """Seconds from a Retry-After header (number or HTTP date); 0 when missing, invalid or not in the future."""
+    if not value:
+        return 0
+    try:
+        return max(0, int(value))
+    except ValueError:
+        pass
+    try:
+        return max(0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (ValueError, TypeError, OverflowError):
+        return 0
+
+
+def safe(fn, prev: dict | None, force: bool = False) -> dict:
+    if prev and not force and time.time() < NEXT_FETCH.get(fn, 0):  # not due yet: keep the last numbers
+        return prev
     until, n = BACKOFF.get(fn, (0, 0))
     if time.time() < until and prev:  # still cooling down after a 429: keep showing the last numbers
         return prev
@@ -345,15 +735,21 @@ def safe(fn, prev: dict | None) -> dict:
         r = fn()
         r["updated"], r["error"] = f"{datetime.now():%d/%m %H:%M:%S}", None
         BACKOFF.pop(fn, None)
+        if fn is fetch_claude:
+            NEXT_FETCH[fn] = time.time() + random.uniform(*CLAUDE_EVERY)
         return r
     except urllib.error.HTTPError as e:
-        if e.code == 429:  # Retry-After is always 0, so back off ourselves: 2, 4, 8, then 15 min max
-            wait = min(900, 120 * 2 ** n)
+        if e.code == 429:  # Retry-After is often 0, then back off ourselves: 3, 6, 12, then 15 min max
+            wait = retry_after(e.headers.get("Retry-After")) or BACKOFF_STEPS[min(n, len(BACKOFF_STEPS) - 1)]
             BACKOFF[fn] = (time.time() + wait, n + 1)
             msg = f"rate limited, retry after {datetime.fromtimestamp(time.time() + wait):%H:%M}"
         else:
             msg = {401: "token expired: use the CLI once"}.get(e.code, f"HTTP {e.code}")
-    except Exception as e:  # missing file, network, bad JSON
+    except FileNotFoundError:  # no auth / credentials file: signed out (or moved aside by a block)
+        msg = "not signed in"
+    except urllib.error.URLError as e:
+        msg = f"offline ({getattr(e, 'reason', e)})"
+    except Exception as e:  # network, bad JSON
         msg = f"{type(e).__name__}: {e}"
     r = dict(prev or {"h5": None, "week": None, "plan": None, "limits": [], "notes": [], "resets": [],
                       "analytics": None, "updated": None})
@@ -371,8 +767,10 @@ def human(v) -> str:
     return f"{v:,.0f}"
 
 
-def popup_segments(key: str, d: dict | None, st: dict | None) -> list[tuple[str, str]]:
-    """The hover text for one tool as (text, tag) pieces; tags style it in a tk.Text widget."""
+def popup_segments(key: str, d: dict | None, st: dict | None, ui: dict | None = None) -> list[tuple[str, str]]:
+    """The hover text for one tool as (text, tag) pieces; tags style it in a tk.Text widget.
+    ui: the limit-reset state of the hover (which [Use] awaits confirmation, a running request, its result)."""
+    ui = ui or {}
     out = []
 
     def line(*parts):
@@ -382,10 +780,30 @@ def popup_segments(key: str, d: dict | None, st: dict | None) -> list[tuple[str,
     name, account = HEADER[key]()
     plan = (d or {}).get("plan")
     line((name, "title"), (f"  {plan}" if plan else "", "dim"))
-    line((account, "dim"))
+    if account != "?":
+        line((account, "dim"))
+    if d and d.get("apikey"):
+        line(("Usage limits not available (API key)", "dim"))
+    g = (d or {}).get("guard")
+    if g:
+        period = dict(LIMIT_PERIODS)[g["period"]]
+        if g["used"] is not None:
+            pct = 100 * g["used"] / g["limit"]
+            line((f"Spending limit ({period.lower()}): ", "dim"),
+                 (f"{fmt_limit(g['used'], g['kind'])} / {fmt_limit(g['limit'], g['kind'])}", "pct_" + level(pct)),
+                 (f"  {pct:.0f}%", "pct_" + level(pct)))
+        if g["blocked"]:
+            line(("BLOCKED", "err"))
+        if g.get("error"):
+            line(("! " + g["error"], "err"))
     if d and d.get("error") and not d["error"].startswith("rate limited"):  # a 429 just retries later: not worth a line
-        cached = d["error"].startswith("cached from")  # start-up: saved numbers until the first fetch
-        line((("" if cached else "! ") + d["error"], "dim" if cached else "err"))
+        # start-up saved numbers, or 5H / Week read from the local log while the API fails: notes, not errors
+        cached = d["error"].startswith(("cached from", "from local log"))
+        text = ("" if cached else "! ") + d["error"]
+        width = 56  # the hover column fits its tables: a long error is wrapped, never widening it
+        while text:
+            line((text[:width], "dim" if cached else "err"))
+            text = ("  " + text[width:]) if len(text) > width else ""
     line(("", ""))
 
     if d and d.get("limits"):
@@ -398,37 +816,67 @@ def popup_segments(key: str, d: dict | None, st: dict | None) -> list[tuple[str,
         line(("", ""))
     if d and d.get("resets"):
         line((f"{'Limit resets':<38}{'Left':>5}   {'Expires':<12}", "head"))
-        for title, count, exp in d["resets"]:
-            line((f"{title[:38]:<38}{count:>5}   {exp:<12}", ""))
+        busy = ui.get("busy") == key
+        for title, count, exp, *rest in d["resets"]:  # 3 items in an old cache: no id, no button
+            rid = rest[0] if rest else None
+            btn = [("  ", ""), ("[Use]", f"use:{key}:{rid}")] if rid and not busy and not d.get("apikey") else []
+            line((f"{title[:38]:<38}{count:>5}   {exp:<12}", ""), *btn)
+            if rid and ui.get("confirm") == (key, rid):  # confirmation right under the row, inside the hover
+                line(("  Use this reset now? It cannot be undone.  ", "warn"),
+                     ("[Yes]", f"yes:{key}:{rid}"), ("  ", ""), ("[No]", "no:"))
+        if busy:
+            line(("  Using the reset…", "dim"))
+        msg = (ui.get("msg") or {}).get(key)
+        if msg:
+            text, tag = msg
+            while text:
+                line(("  " + text[:54], tag))
+                text = text[54:]
         line(("", ""))
 
     cols = ("Today", "7 days", "30 days", "Year", "All time")
     periods = ("today", "7d", "30d", "year", "all")
-    rows = []
-    if d and d.get("analytics"):  # Codex: from the Analytics API
-        rows += [(label, [human(v) for v in vals]) for label, vals in d["analytics"]]
-    elif st:  # Claude Code: no API, so counted from the local logs (typed prompts, edit patches)
-        rows += [(label, [human(st[p][k]) for p in periods]) for label, k in
-                 (("Messages", "messages"), ("Lines added", "lines_added"), ("Lines removed", "lines_removed"))]
+    # Two separate areas, never mixed: the account as the server reports it (Codex Analytics: every machine and
+    # the cloud, but daily data that lags, so today can read 0), and this machine's logs (live, every refresh).
+    server = [(label, [human(v) for v in vals]) for label, vals in (d or {}).get("analytics") or []]
+    local = []
     if st:
-        for label, k, fmt in (("Sessions", "sessions", human), ("Requests", "requests", human),
-                              ("Tool calls", "tool_calls", human), ("Input", "input", human),
-                              ("Output", "output", human), ("Cache read", "cache_read", human),
-                              ("Cache write", "cache_write", human), ("Total tokens", "total", human),
-                              ("Cost", "cost_usd", lambda v: f"${v:,.2f}")):
-            rows.append((label, [fmt(st[p][k]) for p in periods]))
-    if st and d and d.get("stats_note"):
-        line((d["stats_note"], "dim"))
-    if not st:
-        line(("Reading local session logs for tokens / cost…", "dim"))
-        line(("(first start can take ~30 s)", "dim"))
+        for label, k, fmt in (("Messages", "messages", human), ("Lines added", "lines_added", human),
+                              ("Lines removed", "lines_removed", human), ("Sessions", "sessions", human),
+                              ("Requests", "requests", human), ("Tool calls", "tool_calls", human),
+                              ("Input", "input", human), ("Output", "output", human),
+                              ("Cache read", "cache_read", human), ("Cache write", "cache_write", human),
+                              ("Total tokens", "total", human), ("Cost", "cost_usd", lambda v: f"${v:,.2f}")):
+            local.append((label, [fmt(st[p][k]) for p in periods]))
+    hidden = set(ui.get("hidden") or ())  # rows / blocks turned off in Settings
+    local = [(l, v) for l, v in local if "local:" + l not in hidden]
+    server = [(l, v) for l, v in server if "server:" + l not in hidden]
+    header = f"{'':<14}" + "".join(f"{c:>10}" for c in cols)
+    if "local" not in hidden:
+        line(("This machine (local logs, live)", "head"))
+        if st and d and d.get("stats_note"):
+            line((d["stats_note"], "dim"))
+        if not st:
+            line(("Reading local session logs for tokens / cost…", "dim"))
+            line(("(first start can take ~30 s)", "dim"))
+        elif local:
+            line((header, "head"))
+            for label, vals in local:
+                line((f"{label:<14}", "dim" if label != "Cost" else ""),
+                     ("".join(f"{v:>10}" for v in vals), "cost" if label == "Cost" else ""))
+            if st["all"].get("unpriced") and "local:Cost" not in hidden:
+                line((f"Cost leaves out {human(st['all']['unpriced'])} requests to models with no known price", "dim"))
         line(("", ""))
-    if rows:
-        line((f"{'':<14}" + "".join(f"{c:>10}" for c in cols), "head"))
-        for label, vals in rows:
-            line((f"{label:<14}", "dim" if label != "Cost" else ""),
-                 ("".join(f"{v:>10}" for v in vals), "cost" if label == "Cost" else ""))
+    if server and "server" not in hidden:  # below the live local table: the account totals lag
+        line(("Account (server: all machines, updated with a delay)", "head"))
+        line((header, "head"))
+        for label, vals in server:
+            line((f"{label:<14}", "dim"), ("".join(f"{v:>10}" for v in vals), ""))
         line(("", ""))
+    if "models" in hidden and st:
+        st = {**st, "7d": {**st["7d"], "top_models": []}}
+    if "tools" in hidden and st:
+        st = {**st, "7d": {**st["7d"], "top_tools": []}}
     if st and st["7d"]["top_models"]:
         line((f"{'Model (7 days)':<22}{'Tokens':>9}{'Cost':>10}", "head"))
         for m in st["7d"]["top_models"]:
@@ -460,8 +908,8 @@ class App:
         self.root = tk.Tk()
         self.root.overrideredirect(True)
         self.root.configure(bg=BG)
-        # only show tools that are installed (signed in) on this machine
-        self.sources = [k for k, f in SOURCES.items() if f.exists()]
+        # only show tools that are used on this machine (signed in, or API key with local logs)
+        self.sources = [k for k in SOURCES if auth_kind(k)]
         try:
             cached = json.loads(CACHE.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -473,9 +921,12 @@ class App:
                 c["limits"] = [tuple(x) for x in c.get("limits") or []]
                 c["resets"] = [tuple(x) for x in c.get("resets") or []]
                 c["error"] = f"cached from {c.get('updated', '?')}"
+                c["apikey"] = auth_kind(k) == "apikey"  # the sign-in may have changed since the cache was written
                 if c.get("stats"):
                     c["stats_note"] = f"as of {c.get('stats_at', '?')} · updating…"
             self.data[k] = c
+        if extra_codex_files() and cached.get("codex_extra"):
+            self.data["codex_extra"] = cached["codex_extra"]
         self.rows = {}
         try:
             cfg = {**DEFAULT_FONT, **json.loads(SETTINGS.read_text(encoding="utf-8"))}
@@ -489,8 +940,87 @@ class App:
         self.icons = {}
         self.dpi = 0
         self.icon_labels = {}
+        self.build_rows()
+        self.tip = None
+        self.reset_ui = {"confirm": None, "busy": None, "msg": {}}  # [Use] limit reset state shown in the hover
+        self.root.bind("<Enter>", lambda e: self.hover_enter())  # the gaps between the labels count as the widget
+        self.root.bind("<Leave>", lambda e: self.hover_leave())
+        self.menu = tk.Menu(self.root, tearoff=0)
+        self.menu.add_command(label="Refresh", command=self.menu_refresh)
+        self.v_family = tk.StringVar(value=cfg["family"])
+        self.v_size = tk.IntVar(value=cfg["size"])
+        self.v_bold = tk.BooleanVar(value=cfg["bold"])
+        self.v_italic = tk.BooleanVar(value=cfg["italic"])
+        self.v_remaining = tk.BooleanVar(value=cfg["remaining"])
+        self.v_refresh = tk.IntVar(value=cfg["refresh"])
+        self.v_autostart = tk.BooleanVar(value=cfg["autostart"])
+        set_autostart(cfg["autostart"])
+        self.v_autoupdate = tk.BooleanVar(value=cfg["autoupdate"])
+        self.hidden = [h for h in cfg.get("hover_hidden") or [] if isinstance(h, str)]
+        saved = cfg.get("codex_limit") or {}
+        # only a limit the user saved in the dialog counts; otherwise the current defaults apply
+        self.limit = {**DEFAULT_LIMIT, **saved} if saved.get("set") else {}
+        self.limit_dlg = None
+        self.settings_dlg = None
+        # font, size, %, refresh, start-up, update and hover rows all live in the Settings window
+        self.menu.add_command(label="Settings…", command=self.open_settings)
+        self.menu.add_command(label="Codex spending limit…", command=self.open_limit_dialog)
+        self.menu.add_separator()
+        self.menu.add_command(label=f"VibeQuota v{VERSION}", state="disabled")
+        self.menu.add_command(label="Check for updates", command=lambda: self.check_update(manual=True))
+        self.menu.add_separator()
+        self.menu.add_command(label="Exit", command=self.quit)
+        for w in self.root.winfo_children() + [self.root]:
+            w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+            w.bind("<Button-1>", lambda e: self.click_refresh())
+        self.root.update_idletasks()
+        self.hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        self.cfg = cfg  # plain copy the tray thread can read; tk variables are only touched on the tk thread
+        self.embed()
+        M = pystray.MenuItem
+        # tray callbacks run on pystray's thread: everything is handed to tk
+        self.tray = pystray.Icon(APP, Image.open(ASSETS / "app_icon.png"), APP, pystray.Menu(
+            M("Refresh", lambda: self.root.after(0, self.menu_refresh)),
+            pystray.Menu.SEPARATOR,
+            M("Settings…", lambda: self.root.after(0, self.open_settings)),
+            M("Codex spending limit…", lambda: self.root.after(0, self.open_limit_dialog)),
+            pystray.Menu.SEPARATOR,
+            M(f"VibeQuota v{VERSION}", None, enabled=False),
+            M("Check for updates", lambda: self.root.after(0, lambda: self.check_update(manual=True))),
+            pystray.Menu.SEPARATOR,
+            M("Exit", lambda: self.root.after(0, self.quit))))
+        self.tray.run_detached()
+        if not self.sources:
+            self.root.after(3000, lambda: self.notify(
+                "No Codex or Claude Code sign-in (or API key) found. Sign in, then click the widget to refresh."))
+        self.schedule_update_check(30_000)
+        self.show_numbers()  # cached numbers right away, so a restart never shows --%
+        self.refresh()
+
+    def build_rows(self):
+        """One row (icon, 5H, W) per tool in self.sources; rebuilt when a sign-in / API key appears or goes."""
+        for row in self.rows.values():
+            for w in row:
+                w.destroy()
+        for b in self.icon_labels.values():
+            b.destroy()
+        if getattr(self, "empty_label", None):
+            self.empty_label.destroy()
+            self.empty_label = None
+        self.rows, self.icon_labels = {}, {}
+        if not self.sources:  # nothing signed in: say so instead of an empty (invisible) widget
+            self.empty_label = tk.Label(self.root, text="No Codex / Claude sign-in", bg=BG, fg=DIM, font=self.font,
+                                        bd=0, padx=4, pady=0)
+            self.empty_label.grid(row=0, column=0, columnspan=5, sticky="w")
+            w = self.empty_label
+            w.bind("<Enter>", lambda e: self.hover_enter())
+            w.bind("<Leave>", lambda e: self.hover_leave())
+            w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+            w.bind("<Button-1>", lambda e: self.click_refresh())
         for r, key in enumerate(self.sources):
             b = tk.Label(self.root, bg=BG, bd=0)
+            if key in self.icons:
+                b.configure(image=self.icons[key])
             b.grid(row=r, column=0, padx=(2, 4), pady=0)
             # tags stay put; each number follows its tag, in a column wide enough for "100%"
             t5, h5, tw, wk = (tk.Label(self.root, text=t, bg=BG, fg=DIM, font=self.font, bd=0, padx=0, pady=0)
@@ -504,91 +1034,28 @@ class App:
             for w in (b, t5, h5, tw, wk):
                 w.bind("<Enter>", lambda e: self.hover_enter())
                 w.bind("<Leave>", lambda e: self.hover_leave())
-        self.tip = None
-        self.root.bind("<Enter>", lambda e: self.hover_enter())  # the gaps between the labels count as the widget
-        self.root.bind("<Leave>", lambda e: self.hover_leave())
-        self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Refresh", command=self.menu_refresh)
-        self.v_family = tk.StringVar(value=cfg["family"])
-        self.v_size = tk.IntVar(value=cfg["size"])
-        self.v_bold = tk.BooleanVar(value=cfg["bold"])
-        self.v_italic = tk.BooleanVar(value=cfg["italic"])
-        fam = tk.Menu(self.menu, tearoff=0)
-        for f in FONT_CHOICES:
-            fam.add_radiobutton(label=f, variable=self.v_family, value=f, command=self.apply_font)
-        size = tk.Menu(self.menu, tearoff=0)
-        for n in SIZE_CHOICES:
-            size.add_radiobutton(label=str(n), variable=self.v_size, value=n, command=self.apply_font)
-        self.menu.add_separator()
-        self.menu.add_cascade(label="Font", menu=fam)
-        self.menu.add_cascade(label="Size", menu=size)
-        self.menu.add_checkbutton(label="Bold", variable=self.v_bold, command=self.apply_font)
-        self.menu.add_checkbutton(label="Italic", variable=self.v_italic, command=self.apply_font)
-        self.v_remaining = tk.BooleanVar(value=cfg["remaining"])
-        show = tk.Menu(self.menu, tearoff=0)
-        show.add_radiobutton(label="Used %", variable=self.v_remaining, value=False, command=self.apply_remaining)
-        show.add_radiobutton(label="Remaining %", variable=self.v_remaining, value=True, command=self.apply_remaining)
-        self.menu.add_cascade(label="Show", menu=show)
-        self.v_refresh = tk.IntVar(value=cfg["refresh"])
-        every = tk.Menu(self.menu, tearoff=0)
-        for sec, label in REFRESH_CHOICES:
-            every.add_radiobutton(label=label, variable=self.v_refresh, value=sec, command=self.apply_refresh)
-        self.menu.add_cascade(label="Refresh every", menu=every)
-        self.v_autostart = tk.BooleanVar(value=cfg["autostart"])
-        self.menu.add_checkbutton(label="Start with Windows", variable=self.v_autostart, command=self.apply_autostart)
-        set_autostart(cfg["autostart"])
-        self.v_autoupdate = tk.BooleanVar(value=cfg["autoupdate"])
-        self.menu.add_separator()
-        self.menu.add_command(label=f"VibeQuota v{VERSION}", state="disabled")
-        self.menu.add_command(label="Check for updates", command=lambda: self.check_update(manual=True))
-        self.menu.add_checkbutton(label="Auto update", variable=self.v_autoupdate, command=self.save_settings)
-        self.menu.add_separator()
-        self.menu.add_command(label="Exit", command=self.quit)
-        for w in self.root.winfo_children() + [self.root]:
-            w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
-            w.bind("<Button-1>", lambda e: self.click_refresh())
-        self.root.update_idletasks()
-        self.hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-        self.cfg = cfg  # plain copy the tray thread can read; tk variables are only touched on the tk thread
-        self.embed()
-        M = pystray.MenuItem
+                w.bind("<Button-3>", lambda e: self.menu.tk_popup(e.x_root, e.y_root))
+                w.bind("<Button-1>", lambda e: self.click_refresh())
 
-        def tray_set(var, value, then=None):  # tray callbacks run on pystray's thread: hand the change to tk
-            return lambda: self.root.after(0, lambda: (var.set(value), (then or self.apply_font)()))
-
-        self.tray = pystray.Icon(APP, Image.open(ASSETS / "app_icon.png"), APP, pystray.Menu(
-            M("Refresh", lambda: self.root.after(0, self.menu_refresh)),
-            pystray.Menu.SEPARATOR,
-            M("Font", pystray.Menu(*[M(f, tray_set(self.v_family, f), radio=True,
-                                       checked=lambda i, f=f: self.cfg["family"] == f) for f in FONT_CHOICES])),
-            M("Size", pystray.Menu(*[M(str(n), tray_set(self.v_size, n), radio=True,
-                                       checked=lambda i, n=n: self.cfg["size"] == n) for n in SIZE_CHOICES])),
-            M("Bold", lambda: self.root.after(0, lambda: (self.v_bold.set(not self.v_bold.get()), self.apply_font())),
-              checked=lambda i: self.cfg["bold"]),
-            M("Italic", lambda: self.root.after(0, lambda: (self.v_italic.set(not self.v_italic.get()), self.apply_font())),
-              checked=lambda i: self.cfg["italic"]),
-            M("Show", pystray.Menu(*[M(label, tray_set(self.v_remaining, rem, self.apply_remaining), radio=True,
-                                       checked=lambda i, rem=rem: self.cfg["remaining"] == rem)
-                                     for rem, label in ((False, "Used %"), (True, "Remaining %"))])),
-            M("Start with Windows",
-              lambda: self.root.after(0, lambda: (self.v_autostart.set(not self.v_autostart.get()),
-                                                  self.apply_autostart())),
-              checked=lambda i: self.cfg["autostart"]),
-            M("Refresh every", pystray.Menu(*[M(label, tray_set(self.v_refresh, sec, self.apply_refresh), radio=True,
-                                                checked=lambda i, sec=sec: self.cfg["refresh"] == sec)
-                                              for sec, label in REFRESH_CHOICES])),
-            pystray.Menu.SEPARATOR,
-            M(f"VibeQuota v{VERSION}", None, enabled=False),
-            M("Check for updates", lambda: self.root.after(0, lambda: self.check_update(manual=True))),
-            M("Auto update", lambda: self.root.after(0, lambda: (self.v_autoupdate.set(not self.v_autoupdate.get()),
-                                                                 self.save_settings())),
-              checked=lambda i: self.cfg["autoupdate"]),
-            pystray.Menu.SEPARATOR,
-            M("Exit", lambda: self.root.after(0, self.quit))))
-        self.tray.run_detached()
-        self.schedule_update_check(30_000)
-        self.show_numbers()  # cached numbers right away, so a restart never shows --%
-        self.refresh()
+    def sync_sources(self) -> bool:
+        """Re-check which tools are signed in / have a key (cheap file reads). Changed: rebuild the rows."""
+        now = [k for k in SOURCES if auth_kind(k)]
+        if now == self.sources:
+            return False
+        for k in set(self.sources) - set(now):
+            self.data.pop(k, None)
+        for k in now:
+            self.data.setdefault(k, None)
+        self.sources = now
+        self.hide_tip()
+        if self.dpi:  # icons for a newly shown tool
+            px = round(18 * self.dpi / 96)
+            for k in now:
+                if k not in self.icons:
+                    self.icons[k] = ImageTk.PhotoImage(self.icon_src[k].resize((px, px), Image.LANCZOS))
+        self.build_rows()
+        self.show_numbers()
+        return True
 
     def apply_font(self):
         cfg = self.save_settings()
@@ -674,7 +1141,8 @@ class App:
         cfg = {"family": self.v_family.get(), "size": self.v_size.get(), "bold": self.v_bold.get(),
                "italic": self.v_italic.get(), "refresh": self.v_refresh.get(),
                "autostart": self.v_autostart.get(), "autoupdate": self.v_autoupdate.get(),
-               "remaining": self.v_remaining.get()}
+               "remaining": self.v_remaining.get(), "codex_limit": dict(self.limit),
+               "hover_hidden": list(self.hidden)}
         self.cfg = cfg
         self.tray.update_menu()
         SETTINGS.parent.mkdir(parents=True, exist_ok=True)
@@ -722,36 +1190,293 @@ class App:
     def menu_refresh(self):
         """Menu Refresh: layout too (taskbar, tray width, display scale, colour), then the numbers."""
         self.embed()
-        self.refresh()
+        self.refresh(force=True)
 
-    def refresh(self):
+    def refresh(self, force: bool = False):
+        """force (user asked): also fetch what is not due yet; a 429 cool-down still applies."""
         if getattr(self, "_busy", False):  # a click while a refresh is running: let that one finish
             return
         self._busy = True
+        self.sync_sources()  # signed in / out, or a key added, since the last refresh: show or hide that row
 
         def work():
             fetchers = {"codex": fetch_codex, "claude": fetch_claude}
             new = {}
             try:
-                for k in self.sources:
-                    prev = self.data[k]
-                    new[k] = dict(safe(fetchers[k], prev))
+                for k in list(self.sources):
+                    prev = self.data.get(k)
+                    local = {}
                     try:  # local tokens / tools / cost from session logs
-                        new[k]["stats"] = usage_stats.stats(k)
-                        new[k]["stats_at"] = f"{datetime.now():%d/%m %H:%M}"
-                        new[k]["stats_note"] = None
+                        local = {"stats": usage_stats.stats(k), "stats_at": f"{datetime.now():%d/%m %H:%M}",
+                                 "stats_note": None}
                     except Exception:  # keep the previous table rather than an empty one
-                        for f in ("stats", "stats_at", "stats_note"):
-                            new[k][f] = (prev or {}).get(f)
+                        local = {f: (prev or {}).get(f) for f in ("stats", "stats_at", "stats_note")}
+                    guard = None
+                    if k == "codex":  # limit first: an unblock puts auth.json back before the API is called
+                        guard = self.enforce_limit({"apikey": auth_kind(k) == "apikey", **local})
+                    if auth_kind(k) == "apikey":  # no subscription limits to fetch: local stats only
+                        new[k] = {"apikey": True, "h5": None, "week": None, "plan": None, "limits": [], "notes": [],
+                                  "resets": [], "analytics": None, "error": None,
+                                  "updated": f"{datetime.now():%d/%m %H:%M:%S}"}
+                    elif k == "codex" and codex_locked():  # blocked: no sign-in to call the API with
+                        new[k] = dict(prev or {"h5": None, "week": None, "plan": None, "limits": [], "notes": [],
+                                               "resets": [], "analytics": None, "updated": None})
+                        new[k]["error"] = "blocked by the spending limit"
+                        new[k]["apikey"] = False
+                    else:
+                        new[k] = dict(safe(fetchers[k], prev, force))
+                        new[k]["apikey"] = False  # signed in: clear a flag left from an API-key setup
+                    new[k].update(local)
+                    if k == "codex":
+                        err = new[k].get("error") or ""
+                        if not new[k].get("apikey") and err and not err.startswith("cached from"):
+                            codex_limits_from_log(new[k], err)  # API failed: 5H / Week from the last local request
+                        new[k]["guard"] = guard
+                if extra_codex_files():  # extra Codex sign-ins: own popup column, only when such files exist
+                    new["codex_extra"] = {"accounts": fetch_codex_extra(),
+                                          "updated": f"{datetime.now():%d/%m %H:%M:%S}"}
+                else:
+                    new["codex_extra"] = None
             finally:
                 self.root.after(0, self.update_ui, new)
         threading.Thread(target=work, daemon=True).start()
+
+    # ---- Codex spending limit (API key only) ----------------------------------------------------
+    def effective_limit(self) -> dict:
+        """The limit the user saved; until then the default: on ($3 a day) with an API key, off with a
+        ChatGPT sign-in (it has its own 5H / weekly limits), which the user can still turn on."""
+        if self.limit.get("set"):
+            return dict(self.limit)
+        return {**DEFAULT_LIMIT, "on": auth_kind("codex") == "apikey"}
+
+    def enforce_limit(self, d: dict) -> dict | None:
+        """Runs on the refresh thread after the local stats: lock Codex when the limit is reached, unlock it
+        when it is not (new day / month, higher limit, limit off). Returns what the widget and hover show."""
+        lim = self.effective_limit()
+        used = limit_used(d.get("stats"), lim)
+        over = bool(lim["on"] and used is not None and used >= lim["value"])
+        was = codex_locked()
+        err = None
+        try:
+            if lim["on"] and used is None:
+                pass  # stats not readable this time: keep the current state rather than unlock by mistake
+            elif over:
+                if not was or SOURCES["codex"].exists():  # also catches a fresh auth.json made while locked
+                    lock_codex(lim["kill"])
+            elif was:
+                unlock_codex()
+        except OSError as e:
+            err = f"{type(e).__name__}: {e}"
+        now = codex_locked()
+        # Warnings as Token Watch does them: each level once per period, remembered across restarts
+        # (limit_alerts.json); a new day / month, or a changed limit, starts again.
+        if lim["on"] and used is not None:
+            pct = 100 * used / lim["value"]
+            level_now = max((s for s in (*LIMIT_WARN_STEPS, 100) if pct >= s), default=0)
+            key = f"{lim['kind']}|{lim['value']:g}|{lim['period']}|{period_key(lim['period'])}"
+            acked = load_alerts(key)
+            acked = [a for a in acked if a <= pct]  # rolling 7/30 days fell back under a level: warn again later
+            if level_now and level_now not in acked:
+                st = (d.get("stats") or {}).get(lim["period"]) or {}
+                unpriced = " Some usage has no known price, so the real cost is higher." \
+                    if lim["kind"] == "cost" and st.get("unpriced") else ""
+                what = "cost" if lim["kind"] == "cost" else "tokens"
+                tail = " Codex is now blocked." if level_now >= 100 else " Codex is blocked at 100%."
+                self.notify(f"Codex · {dict(LIMIT_PERIODS)[lim['period']]} {what} reached {level_now}% — "
+                            f"{fmt_limit(used, lim['kind'])} / {fmt_limit(lim['value'], lim['kind'])}.{tail}{unpriced}")
+                acked = sorted({*acked, *(s for s in (*LIMIT_WARN_STEPS, 100) if s <= level_now)})
+            save_alerts(key, acked)
+        if was and not now:
+            self.notify("Codex unblocked.")
+        if not lim["on"] and not now:
+            return None
+        return {"used": used, "limit": lim["value"], "kind": lim["kind"], "period": lim["period"],
+                "blocked": now, "error": err}
+
+    def open_settings(self):
+        """One window for the widget's look and behaviour and for what the hover shows. OK applies and saves."""
+        if self.settings_dlg and self.settings_dlg.winfo_exists():
+            self.settings_dlg.lift()
+            return
+        from tkinter import ttk
+        self.hide_tip()
+        dlg = self.settings_dlg = tk.Toplevel(self.root)
+        dlg.title(f"{APP}: Settings")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+        pad = {"padx": 10, "pady": 3}
+
+        wid = ttk.LabelFrame(dlg, text="Widget")
+        wid.grid(row=0, column=0, sticky="nsew", padx=(10, 5), pady=(10, 4))
+        v_family = tk.StringVar(value=self.v_family.get())
+        v_size = tk.StringVar(value=str(self.v_size.get()))
+        v_bold = tk.BooleanVar(value=self.v_bold.get())
+        v_italic = tk.BooleanVar(value=self.v_italic.get())
+        v_show = tk.StringVar(value="Remaining %" if self.v_remaining.get() else "Used %")
+        every = dict(REFRESH_CHOICES)
+        v_every = tk.StringVar(value=every.get(self.v_refresh.get(), REFRESH_CHOICES[0][1]))
+        v_auto = tk.BooleanVar(value=self.v_autostart.get())
+        v_upd = tk.BooleanVar(value=self.v_autoupdate.get())
+        rows = (("Font", ttk.Combobox(wid, textvariable=v_family, values=FONT_CHOICES, state="readonly", width=20)),
+                ("Size", ttk.Combobox(wid, textvariable=v_size, values=[str(n) for n in SIZE_CHOICES],
+                                      state="readonly", width=20)),
+                ("Show", ttk.Combobox(wid, textvariable=v_show, values=["Used %", "Remaining %"],
+                                      state="readonly", width=20)),
+                ("Refresh every", ttk.Combobox(wid, textvariable=v_every, values=[l for _, l in REFRESH_CHOICES],
+                                               state="readonly", width=20)))
+        for i, (label, box) in enumerate(rows):
+            ttk.Label(wid, text=label).grid(row=i, column=0, sticky="w", **pad)
+            box.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=3)
+        style = ttk.Frame(wid)
+        style.grid(row=len(rows), column=1, sticky="w", pady=3)
+        ttk.Checkbutton(style, text="Bold", variable=v_bold).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(style, text="Italic", variable=v_italic).pack(side="left")
+        ttk.Checkbutton(wid, text="Start with Windows", variable=v_auto).grid(
+            row=len(rows) + 1, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Checkbutton(wid, text="Auto update", variable=v_upd).grid(
+            row=len(rows) + 2, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Button(wid, text="Codex spending limit…", command=self.open_limit_dialog).grid(
+            row=len(rows) + 3, column=0, columnspan=2, sticky="w", padx=10, pady=(6, 10))
+
+        hov = ttk.LabelFrame(dlg, text="Hover shows")
+        hov.grid(row=0, column=1, sticky="nsew", padx=(5, 10), pady=(10, 4))
+        shown = {}
+        for i, (key, label) in enumerate(HOVER_BLOCKS):
+            shown[key] = tk.BooleanVar(value=key not in self.hidden)
+            ttk.Checkbutton(hov, text=label, variable=shown[key]).grid(row=i, column=0, columnspan=2,
+                                                                       sticky="w", padx=10, pady=2)
+        base = len(HOVER_BLOCKS)  # rows chosen apart for each table: one column each
+        for col, (table, title, labels) in enumerate((("local", "Local table rows", HOVER_ROWS),
+                                                      ("server", "Server table rows", HOVER_SERVER_ROWS))):
+            ttk.Label(hov, text=title).grid(row=base, column=col, sticky="w", padx=10, pady=(8, 2))
+            for i, label in enumerate(labels):
+                k = f"{table}:{label}"
+                shown[k] = tk.BooleanVar(value=k not in self.hidden)
+                ttk.Checkbutton(hov, text=label, variable=shown[k]).grid(
+                    row=base + 1 + i, column=col, sticky="nw", padx=10, pady=1)
+
+        def ok():
+            self.v_family.set(v_family.get())
+            self.v_size.set(int(v_size.get()))
+            self.v_bold.set(v_bold.get())
+            self.v_italic.set(v_italic.get())
+            self.v_remaining.set(v_show.get() == "Remaining %")
+            new_every = next(s for s, l in REFRESH_CHOICES if l == v_every.get())
+            every_changed = new_every != self.v_refresh.get()
+            self.v_refresh.set(new_every)
+            if v_auto.get() != self.v_autostart.get():
+                self.v_autostart.set(v_auto.get())
+                set_autostart(v_auto.get())
+            self.v_autoupdate.set(v_upd.get())
+            self.hidden = [k for k, v in shown.items() if not v.get()]
+            self.apply_font()  # saves everything and resizes the widget
+            self.show_numbers()
+            if every_changed:
+                self.refresh()
+            dlg.destroy()
+
+        bar = ttk.Frame(dlg)
+        bar.grid(row=1, column=0, columnspan=2, sticky="e", padx=10, pady=(4, 10))
+        ttk.Button(bar, text="OK", width=10, command=ok).pack(side="left", padx=4)
+        ttk.Button(bar, text="Cancel", width=10, command=dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.update_idletasks()
+        dlg.geometry(f"+{(dlg.winfo_screenwidth() - dlg.winfo_reqwidth()) // 2}"
+                     f"+{(dlg.winfo_screenheight() - dlg.winfo_reqheight()) // 2}")
+        dlg.focus_force()
+
+    def open_limit_dialog(self):
+        if self.limit_dlg and self.limit_dlg.winfo_exists():
+            self.limit_dlg.lift()
+            return
+        self.hide_tip()
+        lim = self.effective_limit()
+        dlg = self.limit_dlg = tk.Toplevel(self.root)
+        dlg.title(f"{APP}: Codex spending limit")
+        dlg.attributes("-topmost", True)
+        dlg.resizable(False, False)
+        pad = {"padx": 10, "pady": 4}
+        v_on = tk.BooleanVar(value=lim["on"])
+        v_kind = tk.StringVar(value=lim["kind"])
+        v_period = tk.StringVar(value=dict(LIMIT_PERIODS)[lim["period"]])
+        v_value = tk.StringVar(value=f"{lim['value']:g}")
+        v_kill = tk.BooleanVar(value=lim["kill"])
+        tk.Checkbutton(dlg, text="Block Codex when the limit is reached", variable=v_on).grid(
+            row=0, column=0, columnspan=3, sticky="w", **pad)
+        tk.Label(dlg, text="Count").grid(row=1, column=0, sticky="w", **pad)
+        for i, (val, label) in enumerate(LIMIT_KINDS):
+            tk.Radiobutton(dlg, text=label, variable=v_kind, value=val).grid(row=1, column=1 + i, sticky="w")
+        tk.Label(dlg, text="Period").grid(row=2, column=0, sticky="w", **pad)
+        from tkinter import ttk
+        ttk.Combobox(dlg, textvariable=v_period, values=[l for _, l in LIMIT_PERIODS], state="readonly",
+                     width=16).grid(row=2, column=1, columnspan=2, sticky="w")
+        tk.Label(dlg, text="Limit").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Entry(dlg, textvariable=v_value, width=18).grid(row=3, column=1, sticky="w")
+        unit = tk.Label(dlg, text="")
+        unit.grid(row=3, column=2, sticky="w")
+
+        def show_unit(*_):  # unit follows Count: USD, or tokens
+            unit.config(text="USD ($)" if v_kind.get() == "cost" else "tokens")
+        v_kind.trace_add("write", show_unit)
+        show_unit()
+        # typing a limit means the user wants it: tick "Block Codex" (they can still untick it afterwards)
+        v_value.trace_add("write", lambda *_: v_on.set(True) if v_value.get().strip() else None)
+        tk.Checkbutton(dlg, text="Also close running Codex (CLI / app / VS Code) when blocking",
+                       variable=v_kill).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
+        msg = tk.Label(dlg, text="", fg="#c42b1c")
+        msg.grid(row=6, column=0, columnspan=3, sticky="w", padx=10)
+
+        def ok():
+            try:
+                value = float(v_value.get().replace(",", "").replace("$", "").strip())
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                msg.config(text="Enter a number above 0.")
+                return
+            self.limit = {"on": v_on.get(), "kind": v_kind.get(), "value": value, "kill": v_kill.get(), "set": True,
+                          "period": next(k for k, l in LIMIT_PERIODS if l == v_period.get())}
+            self.save_settings()
+            dlg.destroy()
+            self.refresh(force=True)  # check the new limit now
+
+        bar = tk.Frame(dlg)
+        bar.grid(row=7, column=0, columnspan=3, sticky="e", padx=10, pady=8)
+        tk.Button(bar, text="OK", width=9, command=ok).pack(side="left", padx=4)
+        tk.Button(bar, text="Cancel", width=9, command=dlg.destroy).pack(side="left")
+        dlg.bind("<Return>", lambda e: ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.update_idletasks()
+        dlg.geometry(f"+{(dlg.winfo_screenwidth() - dlg.winfo_reqwidth()) // 2}"
+                     f"+{(dlg.winfo_screenheight() - dlg.winfo_reqheight()) // 2}")
+        dlg.focus_force()
+
+    def switch_account(self, name: str):
+        """Make ~/.codex/auth_<name>.json the active Codex sign-in (the current one is kept as auth_<user>.json)."""
+        from tkinter import messagebox
+        acct = next((a for a in ((self.data.get("codex_extra") or {}).get("accounts") or []) if a["file"] == name), {})
+        self.hide_tip()
+        expired = ("\n\nThis account's token has expired: Codex may ask you to sign in again after switching."
+                   if acct.get("expired") else "")
+        if not messagebox.askyesno(APP, f"Switch Codex to {acct.get('email', name)}?\n\n"
+                                        "Close Codex (CLI / app / VS Code) first: a running Codex can write\n"
+                                        "its old token back to auth.json. Reopen it after switching." + expired):
+            return
+        try:
+            saved = switch_codex_account(name)
+        except Exception as e:
+            messagebox.showerror(APP, f"Switch failed, nothing changed:\n{type(e).__name__}: {e}")
+            return
+        self.notify(f"Codex now uses {acct.get('email', name)}. Previous account saved as {saved}.")
+        self.data["codex"] = None
+        self.click_refresh()
 
     def click_refresh(self):
         for row in self.rows.values():  # dim the numbers until the new ones arrive, so the click is visible
             for lbl in row:
                 lbl.config(fg=DIM)
-        self.refresh()
+        self.refresh(force=True)
 
     def apply_remaining(self):
         self.save_settings()
@@ -760,6 +1485,24 @@ class App:
     def show_numbers(self):
         for key, (t5, h5, tw, wk) in self.rows.items():
             d = self.data.get(key) or {}
+            if d.get("apikey") or (key == "codex" and (d.get("guard") or {}).get("blocked")):
+                # one label across the row instead of 5H / W: API key / spend so far / BLOCKED
+                for w in (h5, tw, wk):
+                    w.grid_remove()
+                g = d.get("guard") if key == "codex" else None
+                if g and g["blocked"]:
+                    t5.config(text="BLOCKED", fg=color(100))
+                elif g and g["used"] is not None:  # e.g. "$1.20 / $5": colour by share of the limit
+                    t5.config(text=f"{fmt_limit(g['used'], g['kind'])} / {fmt_limit(g['limit'], g['kind'])}",
+                              fg=color(100 * g["used"] / g["limit"]))
+                else:
+                    t5.config(text="API key", fg=DIM)
+                t5.grid(columnspan=4)
+                continue
+            t5.config(text="5H")
+            t5.grid(columnspan=1)
+            for w in (h5, tw, wk):
+                w.grid()
             for tag, lbl, v in ((t5, h5, d.get("h5")), (tw, wk, d.get("week"))):
                 lbl.config(text="--%" if v is None else f"{(100 - v if self.cfg['remaining'] else v):.0f}%")
                 for w in (tag, lbl):
@@ -776,8 +1519,13 @@ class App:
         except (OSError, ValueError):
             cache = {}
         for k, d in new.items():  # everything shown in the hover, so a restart can show it at once
+            if k == "codex_extra":
+                cache[k] = d
+                continue
             entry = cache.get(k) or {}
-            if not d.get("error"):  # quota part only when this fetch worked
+            entry["apikey"] = bool(d.get("apikey"))  # always the current kind, even when this fetch failed
+            if not d.get("error"):  # quota part only when this fetch worked: replaced, not merged with old fields
+                entry = {f: entry[f] for f in ("stats", "stats_at") if f in entry}
                 entry.update({f: v for f, v in d.items() if f not in ("stats", "stats_at", "stats_note", "error")})
             if d.get("stats") and not d.get("stats_note"):  # table part only when freshly computed
                 entry.update(stats=d["stats"], stats_at=d.get("stats_at"))
@@ -789,7 +1537,11 @@ class App:
             pass
         if getattr(self, "_timer", None):
             self.root.after_cancel(self._timer)
-        self._timer = self.root.after(self.v_refresh.get() * 1000, self.refresh)
+        delay = every = self.v_refresh.get()
+        left = NEXT_FETCH.get(fetch_claude, 0) - time.time()
+        if every < CLAUDE_EVERY[0] and 0 < left < every:  # Claude falls due before the next tick: do not wait for it
+            delay = left
+        self._timer = self.root.after(int(delay * 1000) + 50, self.refresh)
 
     # The popup stays open while the mouse is on the widget or on the popup itself; it closes a moment
     # after the mouse has left both, so there is time to move from the widget up into the popup.
@@ -815,9 +1567,21 @@ class App:
         self.tip.bind("<Leave>", lambda e: self.hover_leave())
         fs = self.cfg["size"]  # popup text follows the widget's Size setting (10 = default)
         mono = ("Consolas", fs)
-        for i, k in enumerate(self.sources):  # all tools side by side in one popup
+        columns = []
+        for k in self.sources:  # all tools side by side in one popup
             d = self.data.get(k)
-            segs = popup_segments(k, d, d.get("stats") if d else None)
+            columns.append(popup_segments(k, d, d.get("stats") if d else None,
+                                          {**self.reset_ui, "hidden": self.hidden}))
+        if not self.sources:
+            columns.append([("VibeQuota", "title"), ("\n", ""),
+                            ("Neither Codex nor Claude Code is signed in on this machine,", "dim"), ("\n", ""),
+                            ("and no API key was found.", "dim"), ("\n\n", ""),
+                            ("Sign in to the Codex CLI / app, or to Claude Code (or set an API key),", ""),
+                            ("\n", ""), ("then click here to refresh.", "")])
+        extra = self.data.get("codex_extra")
+        if extra and extra.get("accounts"):  # only when ~/.codex/auth_*.json exist
+            columns.append(codex_extra_segments(extra["accounts"], extra.get("updated")))
+        for i, segs in enumerate(columns):
             text = "".join(t for t, _ in segs)
             w = tk.Text(self.tip, bg=bg, fg="#e8e8e8", font=mono, bd=0, highlightthickness=0, padx=14, pady=10,
                         width=max(len(l) for l in text.splitlines() or [""]) + 1, height=text.count("\n") + 1,
@@ -827,18 +1591,106 @@ class App:
             w.tag_configure("dim", foreground="#9a9a9a")
             w.tag_configure("err", foreground="#ff7b72")
             w.tag_configure("cost", foreground="#7ee787", font=("Consolas", fs, "bold"))
+            w.tag_configure("warn", foreground="#ffb02e")
             for lvl, c in (("ok", "#7ee787"), ("mid", "#ffb02e"), ("hi", "#ff7b72")):
                 w.tag_configure("pct_" + lvl, foreground=c, font=("Consolas", fs, "bold"))
             for t, tag in segs:
+                if tag.startswith("switch:"):  # clickable [Switch] next to an extra Codex account
+                    name = tag.split(":", 1)[1]
+                    w.tag_configure(tag, foreground="#8ab4f8", font=("Consolas", fs, "bold", "underline"))
+                    w.tag_bind(tag, "<Button-1>", lambda e, n=name: self.switch_account(n))
+                    w.tag_bind(tag, "<Enter>", lambda e, w=w: w.config(cursor="hand2"))
+                    w.tag_bind(tag, "<Leave>", lambda e, w=w: w.config(cursor="arrow"))
+                elif tag.startswith(("use:", "yes:", "no:")):  # limit-reset buttons, confirmed inside the hover
+                    w.tag_configure(tag, font=("Consolas", fs, "bold"),
+                                    foreground={"use": "#8ab4f8", "yes": "#7ee787", "no": "#ff7b72"}[tag.split(":")[0]])
+                    w.tag_bind(tag, "<Button-1>", lambda e, t=tag: self.reset_click(t))
+                    w.tag_bind(tag, "<Enter>", lambda e, w=w: w.config(cursor="hand2"))
+                    w.tag_bind(tag, "<Leave>", lambda e, w=w: w.config(cursor="arrow"))
                 w.insert("end", t, tag or ())
             w.configure(state="disabled")
+            # the bigger title font makes the text a little taller than its line count, so a tk.Text would
+            # scroll by that bit on the mouse wheel: the hover never scrolls
+            w.bind("<MouseWheel>", lambda e: "break")
             w.grid(row=0, column=i, sticky="ns", padx=(1 if i == 0 else 0, 1), pady=1)
+            if i < len(self.sources) and self.sources[i] == "codex":
+                self.add_bell(w, bg, fs)
         self.tip.update_idletasks()
         r = wintypes.RECT()  # we are a taskbar child, so ask Windows for our screen position
         ctypes.windll.user32.GetWindowRect(self.hwnd, ctypes.byref(r))
         x = min(r.left, self.root.winfo_screenwidth() - self.tip.winfo_reqwidth() - 4)
         y = r.top - self.tip.winfo_reqheight() - 4  # small gap: quick to cross into the popup
         self.tip.geometry(f"+{x}+{max(0, y)}")
+
+    def add_bell(self, w, bg, fs):
+        """Big bell at the top right of the Codex column: opens the spending limit. Its colour is the state:
+        grey off, green under 80%, orange from 80%, red when blocked."""
+        g = (self.data.get("codex") or {}).get("guard")
+        if not (g and (g["blocked"] or self.effective_limit()["on"])):
+            fg, hint = "#9a9a9a", "Spending limit off"
+        elif g and g["blocked"]:
+            fg, hint = "#ff7b72", "Blocked"
+        else:
+            pct = 100 * g["used"] / g["limit"] if g and g["used"] is not None else 0
+            fg = "#ffb02e" if pct >= LIMIT_WARN_STEPS[0] else "#7ee787"
+            hint = f"{pct:.0f}% of limit"
+        box = tk.Frame(w, bg=bg, cursor="hand2")
+        # one small line level with the title: "Spending limit off 🔔"
+        tk.Label(box, text=hint, font=("Segoe UI", max(fs - 1, 7)), bg=bg, fg=fg, bd=0,
+                 cursor="hand2").pack(side="left", padx=(0, 3))
+        tk.Label(box, text="\U0001F514", font=("Segoe UI Emoji", fs + 1), bg=bg, fg=fg, bd=0,
+                 cursor="hand2").pack(side="left")
+        box.place(relx=1.0, x=-14, y=12, anchor="ne")
+        for x in (box, *box.winfo_children()):
+            x.bind("<Button-1>", lambda e: self.open_limit_dialog())
+
+    def reset_click(self, tag: str):
+        """[Use] asks inside the hover, [Yes] spends the reset in the background, [No] cancels."""
+        kind, _, rest = tag.partition(":")
+        key, _, rid = rest.partition(":")
+        msg = self.reset_ui["msg"]
+        if kind == "use":
+            self.reset_ui["confirm"] = (key, rid)
+            msg.pop(key, None)
+        elif kind == "no":
+            self.reset_ui["confirm"] = None
+        elif kind == "yes" and not self.reset_ui["busy"]:
+            self.reset_ui.update(confirm=None, busy=key)
+
+            def work():
+                try:
+                    use_limit_reset(key, rid)
+                    result = ("Reset used. Limits are being refreshed.", "cost")
+                except Exception as e:  # noqa: BLE001 - any failure is shown, nothing else to do
+                    result = (f"Reset not used: {e}", "err")
+                self.root.after(0, done, result)
+
+            def done(result):
+                self.reset_ui.update(busy=None)
+                msg[key] = result
+                if result[1] == "cost":
+                    NEXT_FETCH.pop(fetch_claude, None)  # the Claude throttle must not hide the new numbers
+                    self.click_refresh()
+                self.rerender_tip()
+
+            threading.Thread(target=work, daemon=True).start()
+        self.rerender_tip()
+
+    def rerender_tip(self):
+        """Redraw an open hover in place. Re-creating it under the mouse fires a Leave on the old window,
+        so the hide that this schedules is cancelled once the pointer is seen over the new one."""
+        if not self.tip:
+            return
+        self.show_tip()
+
+        def keep():
+            if not self.tip:
+                return
+            px, py = self.root.winfo_pointerxy()
+            x, y = self.tip.winfo_rootx(), self.tip.winfo_rooty()
+            if x <= px < x + self.tip.winfo_width() and y <= py < y + self.tip.winfo_height():
+                self.hover_enter()
+        self.root.after(60, keep)
 
     def hide_tip(self):
         self._hide_job = None
